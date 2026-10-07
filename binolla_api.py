@@ -2232,27 +2232,61 @@ def save_candles_to_json(candles: List[Dict], asset: str,
 # SECTION 12: KEEPALIVE & CONNECT HELPERS
 # ==============================================================================
 async def keepalive_loop(client: "Binolla", stop_event: asyncio.Event) -> None:
-    """يراقب صحة الاتصال دون إرسال أي رسالة بروتوكولية.
+    """حلقة نشطة للحفاظ على اتصال WebSocket ومنع "نوم" السيرفر.
 
-    في EIO=4 (Socket.IO v4)، **الخادم** هو من يُرسل "2" (PING) كل ~25 ثانية،
-    والعميل يردّ بـ "3" (PONG) داخل `BinollaWebsocketClient.on_message`.
-    إرسال "2" من العميل في EIO=4 يُعتبر مخالفة بروتوكول ويُغلق الاتصال فوراً.
+    في EIO=4 (Socket.IO v4)، الخادم يُرسل "2" (PING) كل ~25 ثانية، والعميل
+    يردّ بـ "3" (PONG) داخل `BinollaWebsocketClient.on_message`. هذا يكفي للحفاظ
+    على الاتصال، لكن لإبقاء تدفق الأسعار اللحظية مستمراً:
 
-    لذا هذه الحلقة لا ترسل شيئاً — فقط تراقب `last_message_at` وتُسلّط ضوءاً
-    إذا بدا الاتصال معلّقاً (أكثر من 60 ثانية دون أي رسالة من الخادم).
+    - كل 5 ثوانٍ: نُرسل `quotes/list` لطلب الأسعار اللحظية (يُجبر السيرفر على
+      إرسال تحديثات s_quotes/list بدلاً من الانتظار السلبي).
+    - كل 30 ثانية: نُرسل `assets/list` لطلب قائمة الأصول المُحدّثة.
+    - نراقب `last_message_at` — إن لم تصل أي رسالة لأكثر من 60 ثانية، نُسجّل
+      تحذيراً (الاتصال قد يكون معلّقاً).
     """
+    quotes_interval = 5.0   # ثانية بين كل طلب quotes/list
+    assets_interval = 30.0  # ثانية بين كل طلب assets/list
+    last_quotes_at = 0.0
+    last_assets_at = 0.0
+    start = time.time()
+
     while not stop_event.is_set():
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=KEEPALIVE_INTERVAL)
+            await asyncio.wait_for(stop_event.wait(), timeout=1.0)
         except asyncio.TimeoutError:
             pass
         if stop_event.is_set():
             break
-        # فحص صحي فقط: هل لا تزال الرسائل تأتي؟
-        if client.api:
-            idle = time.time() - client.api.last_message_at
-            if idle > 60.0:
-                logger.warning("No WebSocket messages in %.0fs — connection may be stale.", idle)
+        if not client.api:
+            continue
+
+        now = time.time()
+
+        # 1) تحقق من صحة الاتصال
+        if not client.api.state.check_accepted_connection:
+            logger.warning("Connection lost (auth flag cleared). Watchdog will reconnect.")
+            continue
+
+        # 2) أرسل quotes/list كل quotes_interval ثانية (يجلب الأسعار اللحظية + يبقي السيرفر نشطاً)
+        if now - last_quotes_at >= quotes_interval:
+            try:
+                client.api.subscribe_quotes()
+                last_quotes_at = now
+            except Exception as e:
+                logger.debug("keepalive quotes/list err: %s", e)
+
+        # 3) أرسل assets/list كل assets_interval ثانية (يجلب قائمة الأصول المُحدّثة)
+        if now - last_assets_at >= assets_interval:
+            try:
+                client.api.fetch_assets()
+                last_assets_at = now
+            except Exception as e:
+                logger.debug("keepalive assets/list err: %s", e)
+
+        # 4) فحص صحي فقط
+        idle = now - client.api.last_message_at
+        if idle > 60.0:
+            logger.warning("No WebSocket messages in %.0fs — connection may be stale.", idle)
 
 
 async def connect_binolla(token: str, is_demo: bool = True,
@@ -2280,6 +2314,158 @@ async def connect_binolla(token: str, is_demo: bool = True,
                 pass
         await asyncio.sleep(1.5)
     return None
+
+
+async def jwt_refresh_loop(client: "Binolla", args: Dict[str, Any],
+                            stop_event: asyncio.Event) -> None:
+    """يُجدّد التوكن (JWT) بصمت قبل انتهاء صلاحيته بـ 120 ثانية.
+
+    آلية العمل:
+    - يفحص صلاحية التوكن كل 60 ثانية.
+    - إن بقي على انتهاء الصلاحية أقل من 120 ثانية، يُعيد تسجيل الدخول عبر
+      HTTP (نفس طريقة email/password المعتادة بدون أي أسئلة).
+    - يُحدّث `client.api.token` و`client.api.state.SSID`.
+    - **لا يُعيد اتصال WebSocket** — التوكن الجديد يُستخدم فقط إن انقطع الاتصال
+      وأراد الـ watchdog إعادة الاتصال. هذا يمنع الحاجة لإعادة الاتصال كل 15 دقيقة.
+    - يُحدّث `credentials.json` بالتوكن الجديد.
+    """
+    email = args.get("email", "")
+    password = args.get("password", "")
+    if not (email and password):
+        logger.info("jwt_refresh_loop: no email/password — refresh disabled.")
+        return
+
+    check_interval = 60.0    # فحص كل 60 ثانية
+    refresh_lead = 120.0     # حدّث قبل انتهاء الصلاحية بـ 120 ثانية
+
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=check_interval)
+        except asyncio.TimeoutError:
+            pass
+        if stop_event.is_set():
+            break
+        if not client.api:
+            continue
+
+        current_token = client.api.token or ""
+        if not current_token:
+            continue
+
+        # تحقق من الصلاحية
+        exp = decode_jwt_exp(current_token)
+        if not exp:
+            # لا يمكن قراءة الـ exp — تجاهل
+            continue
+        now = time.time()
+        remaining = exp - now
+        if remaining > refresh_lead:
+            # ما زال هناك وقت — لا حاجة للتحديث
+            continue
+
+        # اقترب الانتهاء — حدّث التوكن
+        logmsg(f"{Colors.YELLOW}JWT expires in {remaining:.0f}s — refreshing via HTTP login...{Colors.RESET}")
+        new_token = await _http_login(args)
+        if not new_token:
+            logmsg(f"{Colors.RED}JWT refresh failed — will retry in {check_interval:.0f}s.{Colors.RESET}")
+            continue
+
+        # حدّث التوكن في كل مكان
+        client.api.token = new_token
+        client.api.state.SSID = new_token
+        client.token = new_token
+        # حدّث credentials.json
+        save_credentials(
+            token=new_token,
+            email=email,
+            password=password,
+            is_demo=args.get("is_demo", True),
+            proxy=args.get("proxies", ""),
+        )
+        exp_new = decode_jwt_exp(new_token)
+        if exp_new:
+            logmsg(f"{Colors.GREEN}JWT refreshed. New expiry: "
+                   f"{datetime.fromtimestamp(exp_new).strftime('%H:%M:%S')}{Colors.RESET}")
+        else:
+            logmsg(f"{Colors.GREEN}JWT refreshed.{Colors.RESET}")
+
+
+async def watchdog_reconnect_loop(client: "Binolla", args: Dict[str, Any],
+                                    stop_event: asyncio.Event) -> None:
+    """يراقب الاتصال ويُعيد الاتصال تلقائياً عند انقطاعه.
+
+    آلية العمل:
+    - كل 10 ثوانٍ، يفحص `state.check_accepted_connection` و`last_message_at`.
+    - إن كان الاتصال ميتاً (لا رسائل منذ 90+ ثانية، أو رُفضت المصادقة)،
+      يُعيد بناء `BinollaWebsocketClient` بـ JWT محدّث ويُعيد الاتصال.
+    - لا يطلب أي إدخال من المستخدم.
+    """
+    check_interval = 10.0
+    stale_threshold = 90.0    # 90 ثانية بدون رسائل = اتصال ميت
+
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=check_interval)
+        except asyncio.TimeoutError:
+            pass
+        if stop_event.is_set():
+            break
+        if not client.api:
+            continue
+
+        # تحقق من حالة الاتصال
+        connected = client.api.state.check_accepted_connection
+        idle = time.time() - client.api.last_message_at
+        ws_status = client.api.state.status
+
+        if connected and idle < stale_threshold:
+            # كل شيء بخير
+            continue
+        if ws_status == WebsocketStatus.CONNECTING:
+            # ما زال يحاول الاتصال — انتظر
+            continue
+
+        # الاتصال ميت أو معلّق — أعد الاتصال
+        logmsg(f"{Colors.YELLOW}Watchdog: connection dead (connected={connected}, "
+               f"idle={idle:.0f}s, status={ws_status.name}). Reconnecting...{Colors.RESET}")
+
+        # أغلق العميل القديم
+        try:
+            await client.close()
+        except Exception:
+            pass
+        await asyncio.sleep(1.0)
+
+        # احصل على أحدث توكن
+        current_token = client.api.token or client.token or ""
+        if not current_token or is_token_expired(current_token):
+            logmsg(f"{Colors.CYAN}Watchdog: refreshing JWT before reconnect...{Colors.RESET}")
+            new_token = await _http_login(args)
+            if not new_token:
+                logmsg(f"{Colors.RED}Watchdog: refresh failed. Will retry in {check_interval:.0f}s.{Colors.RESET}")
+                continue
+            current_token = new_token
+            client.api.token = new_token
+            client.api.state.SSID = new_token
+            client.token = new_token
+
+        # أعد بناء الاتصال
+        logmsg(f"{Colors.CYAN}Watchdog: reconnecting WebSocket...{Colors.RESET}")
+        try:
+            ok, reason = await asyncio.wait_for(client.connect(), timeout=30)
+            if ok:
+                logmsg(f"{Colors.GREEN}Watchdog: reconnected successfully.{Colors.RESET}")
+                # أعد إرسال اشتراكات sentiment العامة بعد إعادة الاتصال
+                try:
+                    client.api.subscribe_global_sentiment()
+                except Exception:
+                    pass
+            else:
+                logmsg(f"{Colors.RED}Watchdog: reconnect failed: {reason}{Colors.RESET}")
+        except asyncio.TimeoutError:
+            logmsg(f"{Colors.RED}Watchdog: reconnect timed out.{Colors.RESET}")
+        except Exception as e:
+            logmsg(f"{Colors.RED}Watchdog: reconnect error: {e}{Colors.RESET}")
 
 
 async def fetch_candles_for_asset(client: Binolla, asset: str, days: int,
@@ -2777,24 +2963,27 @@ def parse_args() -> Dict[str, Any]:
 
 
 # ==============================================================================
-# SECTION 15: MAIN LOOP (no interactive prompts — auto login + assets fetch)
+# SECTION 15: MAIN LOOP (continuous — no prompts, server stays alive)
 # ==============================================================================
 async def main_async():
-    """التدفق الرئيسي الجديد — بدون أي أسئلة تفاعلية:
+    """التدفق الرئيسي — حلقة مستمرة بدون أي أسئلة تفاعلية:
 
-    1) يحمّل credentials.json تلقائياً
-    2) إن وُجد JWT صالح يستخدمه، وإلا يعيد تسجيل الدخول بالإيميل/كلمة السر
+    1) يحمّل credentials.json تلقائياً (الإيميل + كلمة السر)
+    2) يسجّل الدخول عبر HTTP email/password
     3) يتصل مباشرة بحساب DEMO
-    4) يجلب كل الأصول المتوفرة + نسبة الدفع + السعر اللحظي
-    5) يحفظ النتيجة في JSON ويعرض ملخصاً
+    4) يشغّل 3 مهام خلفية متوازية:
+       a) keepalive_loop: يرسل quotes/list كل 5 ثوانٍ (يجلب الأسعار اللحظية + يبقي السيرفر نشطاً)
+       b) jwt_refresh_loop: يحدّث JWT قبل انتهائه بـ 120 ثانية (لا حاجة لإعادة الاتصال)
+       c) watchdog_reconnect_loop: يعيد الاتصال تلقائياً عند الانقطاع
+    5) يعرض الأسعار اللحظية كل 10 ثوانٍ ويحدّث ملف JSON كل 60 ثانية
+    6) لا ينتهي إلا بـ Ctrl+C
     """
     args = parse_args()
     print_banner()
 
-    # ===== 1) تسجيل دخول تلقائي (بدون أسئلة) =====
-    # فرض DEMO ما لم يُمرّر المستخدم --real صراحةً
+    # ===== 1) تسجيل دخول تلقائي (الإيميل + كلمة السر فقط) =====
     args["is_demo"] = not (args.get("is_demo") is False)
-    logmsg(f"{Colors.CYAN}Auto-login: loading credentials.json...{Colors.RESET}")
+    logmsg(f"{Colors.CYAN}Auto-login: loading credentials.json (email + password)...{Colors.RESET}")
     token = await auto_login(args)
     if not token:
         logmsg(f"{Colors.RED}Cannot proceed without a valid JWT. Exiting.{Colors.RESET}")
@@ -2803,9 +2992,9 @@ async def main_async():
     email = args.get("email", "")
     password = args.get("password", "")
 
-    # تحقق نهائي من الصلاحية
+    # تحقق نهائي
     if is_token_expired(token):
-        logmsg(f"{Colors.YELLOW}JWT appears expired — attempting re-login...{Colors.RESET}")
+        logmsg(f"{Colors.YELLOW}JWT expired — re-login via email/password...{Colors.RESET}")
         if email and password:
             token = await _http_login(args)
             if not token:
@@ -2823,7 +3012,7 @@ async def main_async():
         print(f"\n{Colors.RED}Connection failed after multiple attempts.{Colors.RESET}")
         return
 
-    # حفظ الاعتمادات المُحدّثة
+    # حفظ الاعتمادات
     save_credentials(
         token=token,
         email=email,
@@ -2833,90 +3022,126 @@ async def main_async():
     )
     print(f"{Colors.GREEN}Credentials saved to {CREDENTIALS_FILE.name}{Colors.RESET}\n")
 
-    # ابدأ keepalive
-    stop_keepalive = asyncio.Event()
-    keepalive_task = asyncio.create_task(keepalive_loop(client, stop_keepalive))
+    # ===== 3) جلب أولي لكل الأصول + نسبة الدفع =====
+    print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
+    print(f"{Colors.BOLD}  Initial fetch: all assets + payout% + live prices{Colors.RESET}")
+    print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
+    initial = await fetch_all_assets_info(client, wait_seconds=8.0)
+    if "error" not in initial:
+        assets = initial.get("assets", [])
+        print(f"{Colors.GREEN}Got {len(assets)} assets initially.{Colors.RESET}")
 
-    try:
-        # ===== 3) جلب كل الأصول + نسبة الدفع + السعر اللحظي =====
-        print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
-        print(f"{Colors.BOLD}  Fetching all assets + payout % + live prices{Colors.RESET}")
-        print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
+    # ===== 4) شغّل المهام الخلفية الثلاث =====
+    stop_event = asyncio.Event()
+    keepalive_task = asyncio.create_task(keepalive_loop(client, stop_event))
+    jwt_refresh_task = asyncio.create_task(jwt_refresh_loop(client, args, stop_event))
+    watchdog_task = asyncio.create_task(watchdog_reconnect_loop(client, args, stop_event))
+    logmsg(f"{Colors.CYAN}Background tasks started: keepalive (5s), JWT refresh, watchdog.{Colors.RESET}")
 
-        result = await fetch_all_assets_info(client, wait_seconds=10.0)
-
-        if "error" in result:
-            print(f"{Colors.RED}Error: {result['error']}{Colors.RESET}")
-        else:
-            assets = result.get("assets", [])
-            print(f"\n{Colors.GREEN}Fetched {len(assets)} assets.{Colors.RESET}")
-
-            # اعرض جدول ملخص لأول 30 أصل
-            print(f"\n{Colors.BOLD}Sample (first 30):{Colors.RESET}")
-            print(f"  {'Asset':<20} {'Payout%':<10} {'Price':<15}")
-            print(f"  {'-'*20} {'-'*10} {'-'*15}")
-            for a in assets[:30]:
-                payout = a.get("payout")
-                payout_str = f"{payout}" if payout is not None else "—"
-                price = a.get("price")
-                price_str = f"{price}" if price is not None else "—"
-                print(f"  {a['asset']:<20} {payout_str:<10} {price_str:<15}")
-
-            # إحصاءات
-            with_payout = sum(1 for a in assets if a.get("payout") is not None)
-            with_price = sum(1 for a in assets if a.get("price") is not None)
-            with_signals = sum(1 for a in assets if a.get("signals"))
-            print(f"\n{Colors.CYAN}Stats:{Colors.RESET}")
-            print(f"  Total assets:        {len(assets)}")
-            print(f"  With payout (sentiment): {with_payout}")
-            print(f"  With live price:     {with_price}")
-            print(f"  With signals:        {with_signals}")
-
-            # احفظ النتيجة في JSON
-            out_path = save_assets_info_to_json(result)
-            print(f"\n{Colors.GREEN}Saved assets info to:{Colors.RESET}")
-            print(f"  {Colors.CYAN}{out_path.absolute()}{Colors.RESET}")
-
-        # ===== 4) (اختياري) إذا مُرّر --asset عبر CLI، اجلب الشموع أيضاً =====
-        if args.get("asset") and args.get("days"):
+    # ===== 5) (اختياري) جلب الشموع إذا طُلب =====
+    if args.get("asset") and args.get("days"):
+        try:
             asset = normalize_asset(args["asset"])
             days = int(args["days"])
             timeframe = int(args["timeframe"])
-            print(f"\n{Colors.CYAN}{'-'*60}{Colors.RESET}")
-            print(f"{Colors.BOLD}  Bonus: fetching candles for {asset}{Colors.RESET}")
-            print(f"{Colors.CYAN}{'-'*60}{Colors.RESET}")
+            print(f"\n{Colors.CYAN}Fetching candles for {asset} ({days}d, M{timeframe})...{Colors.RESET}")
             candles = await fetch_candles_for_asset(
                 client, asset, days, timeframe, idx=1, total=1)
             if candles:
                 filepath = save_candles_to_json(candles, asset, timeframe, days)
-                if filepath:
-                    print(f"{Colors.GREEN}Saved {len(candles)} candles to: {filepath.absolute()}{Colors.RESET}")
-            else:
-                print(f"{Colors.YELLOW}No candles fetched for {asset}.{Colors.RESET}")
+                print(f"{Colors.GREEN}Saved {len(candles)} candles to: {filepath.absolute()}{Colors.RESET}")
+        except Exception as e:
+            logmsg(f"{Colors.YELLOW}Candle fetch error: {e}{Colors.RESET}")
 
-        # ابقَ متصلاً قليلاً لاستقبال المزيد من تحديثات sentiment/quotes
-        print(f"\n{Colors.CYAN}Staying connected for 15s to receive more updates...{Colors.RESET}")
-        print(f"{Colors.DIM}(Press Ctrl+C to stop earlier){Colors.RESET}")
-        try:
-            await asyncio.sleep(15.0)
-        except KeyboardInterrupt:
-            pass
+    # ===== 6) الحلقة الرئيسية: عرض الأسعار اللحظية كل 10 ثوانٍ =====
+    print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
+    print(f"{Colors.BOLD}  Live price stream (updates every 10s, JSON save every 60s){Colors.RESET}")
+    print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
+    print(f"{Colors.DIM}Press Ctrl+C to stop.{Colors.RESET}\n")
 
-        # إن وُجدت تحديثات إضافية، احفظ نسخة محدّثة
-        if client.api and (client.api.assets_sentiment or client.api.assets_quotes):
-            updated = await fetch_all_assets_info(client, wait_seconds=2.0)
-            if "error" not in updated:
-                out_path2 = save_assets_info_to_json(updated)
-                print(f"{Colors.GREEN}Updated assets info saved to: {out_path2.absolute()}{Colors.RESET}")
+    display_interval = 10.0    # عرض كل 10 ثوان
+    save_interval = 60.0       # حفظ JSON كل 60 ثانية
+    last_display = 0.0
+    last_save = 0.0
+    tick_count = 0
 
+    try:
+        while True:
+            now = time.time()
+
+            # === عرض الأسعار اللحظية ===
+            if now - last_display >= display_interval:
+                last_display = now
+                tick_count += 1
+                if client.api:
+                    quotes = client.api.assets_quotes
+                    sentiments = client.api.assets_sentiment
+                    n_quotes = len(quotes)
+                    n_sentiment = len(sentiments)
+                    idle = now - client.api.last_message_at
+                    connected = client.api.state.check_accepted_connection
+                    status_color = Colors.GREEN if connected else Colors.RED
+                    status_str = "CONNECTED" if connected else "DISCONNECTED"
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    print(f"\n{Colors.DIM}[{ts}]{Colors.RESET} "
+                          f"tick #{tick_count}  "
+                          f"{status_color}{status_str}{Colors.RESET}  "
+                          f"idle={idle:.0f}s  "
+                          f"prices={n_quotes}  payouts={n_sentiment}")
+                    # اعرض أول 5 أصول لديها سعر
+                    shown = 0
+                    for asset_name, quote in list(quotes.items())[:5]:
+                        price = None
+                        if isinstance(quote, dict):
+                            for k in ("price", "value", "rate", "last"):
+                                if k in quote:
+                                    price = quote[k]; break
+                        elif isinstance(quote, (int, float)):
+                            price = float(quote)
+                        sent = sentiments.get(asset_name, {})
+                        payout = sent.get("sentiment") if isinstance(sent, dict) else None
+                        payout_str = f"{payout}%" if payout is not None else "—"
+                        price_str = f"{price}" if price is not None else "—"
+                        print(f"  {asset_name:<20} payout={payout_str:<6} price={price_str}")
+                        shown += 1
+                    if shown == 0:
+                        print(f"  {Colors.DIM}(waiting for first quotes...){Colors.RESET}")
+
+            # === حفظ JSON دورياً ===
+            if now - last_save >= save_interval:
+                last_save = now
+                try:
+                    if client.api and (client.api.assets_sentiment or client.api.assets_quotes):
+                        snapshot = await fetch_all_assets_info(client, wait_seconds=0.5)
+                        if "error" not in snapshot:
+                            out_path = save_assets_info_to_json(snapshot)
+                            ts = datetime.now().strftime("%H:%M:%S")
+                            print(f"{Colors.DIM}[{ts}] Saved snapshot to {out_path.name}{Colors.RESET}")
+                except Exception as e:
+                    logger.debug("snapshot save error: %s", e)
+
+            await asyncio.sleep(1.0)
+
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
     finally:
-        stop_keepalive.set()
-        try:
-            await asyncio.wait_for(keepalive_task, timeout=2.0)
-        except Exception:
-            pass
+        stop_event.set()
+        for t in (keepalive_task, jwt_refresh_task, watchdog_task):
+            try:
+                await asyncio.wait_for(t, timeout=2.0)
+            except Exception:
+                pass
         try:
             await client.close()
+        except Exception:
+            pass
+        # احفظ لقطة نهائية
+        try:
+            if client.api and (client.api.assets_sentiment or client.api.assets_quotes):
+                final = await fetch_all_assets_info(client, wait_seconds=0.5)
+                if "error" not in final:
+                    out = save_assets_info_to_json(final)
+                    print(f"\n{Colors.GREEN}Final snapshot saved to: {out.absolute()}{Colors.RESET}")
         except Exception:
             pass
         print(f"{Colors.CYAN}Shutdown complete.{Colors.RESET}")
