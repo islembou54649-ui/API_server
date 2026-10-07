@@ -2741,36 +2741,124 @@ def _extract_asset_names(assets_payload: Any) -> List[str]:
     """يستخرج أسماء الأصول من حملة s_assets/list بأي صيغة محتملة.
 
     الصيغ المدعومة:
-      - ["EURUSD_otc", "GBPUSD_otc", ...]               (قائمة أسماء)
-      - [{"asset":"EURUSD_otc",...}, ...]                (قائمة dicts)
-      - {"assets":[{"asset":"EURUSD_otc",...}, ...]}     (dict مع مفتاح assets)
-      - {"EURUSD_otc":{...}, "GBPUSD_otc":{...}}          (dict بأسماء الأصول كمفاتيح)
+      - ["EURUSD_otc", "GBPUSD_otc", ...]                (قائمة أسماء)
+      - [{"asset":"EURUSD_otc",...}, ...]                 (قائمة dicts)
+      - {"assets":[{"asset":"EURUSD_otc",...}, ...]}      (dict مع مفتاح assets)
+      - {"EURUSD_otc":{...}, "GBPUSD_otc":{...}}           (dict بأسماء الأصول كمفاتيح)
+      - [[ [442,'0700.HK_otc','0700.HK (OTC)','stock',3,93,...], ... ]]  (Binolla tuple format)
+        ← قائمة ثلاثية التداخل، كل tuple: [id, asset_code, display_name, type, ...]
+    """
+    records = _extract_asset_records(assets_payload)
+    if records:
+        return [r.get("asset", "") for r in records if r.get("asset")]
+    return []
+
+
+def _extract_asset_records(assets_payload: Any) -> List[Dict[str, Any]]:
+    """يستخرج سجلات الأصول الكاملة من حملة s_assets/list بأي صيغة.
+
+    الصيغة الفعلية لـ Binolla (كما التُقطت من المتصفح):
+        [[[442, '0700.HK_otc', '0700.HK (OTC)', 'stock', 3, 93, None, None, None, 1,
+           None, None, None, 1791417600, True, None, 70, 0.93, 93, 93, 0, 0,
+           -0.09, -5.87, None, -30.61, 0.04, 0, 0], ...]]
+
+    حيث كل tuple يمثّل أصل، وحقوله (بالترتيب):
+        [0]  id              : 442 (int)
+        [1]  asset_code      : '0700.HK_otc' (str)  ← اسم الأصل
+        [2]  display_name    : '0700.HK (OTC)' (str)
+        [3]  type            : 'stock' / 'currency' / 'crypto' / 'commodity'
+        [4]  group_id        : 3 (int)
+        [5]  payout          : 93 (int, نسبة الدفع %)
+        [13] expire_at       : 1791417600 (timestamp)
+        [14] is_tradable     : True
+        [16] precision       : 70 (int)
+        [17] step            : 0.93 (float)
+        [18] bid             : 93 (float)
+        [19] ask             : 93 (float)
+
+    يُعيد قائمة dicts بصيغة موحّدة:
+        [{"id":..., "asset":..., "name":..., "type":..., "payout":..., ...}]
     """
     if assets_payload is None:
         return []
-    # قائمة أسماء نصية
-    if isinstance(assets_payload, list):
-        names = []
-        for item in assets_payload:
-            if isinstance(item, str):
-                names.append(item)
-            elif isinstance(item, dict):
-                name = item.get("asset") or item.get("name") or item.get("symbol")
-                if name:
-                    names.append(name)
-        return names
-    # dict
-    if isinstance(assets_payload, dict):
-        # ابحث عن مفتاح قائمة معروف
-        for key in ("assets", "data", "list", "items"):
-            if key in assets_payload and isinstance(assets_payload[key], list):
-                return _extract_asset_names(assets_payload[key])
-        # كل المفاتيح هي أسماء الأصول
-        names = []
-        for k, v in assets_payload.items():
-            if isinstance(k, str) and not k.startswith("_"):
-                names.append(k)
-        return names
+
+    # فك التداخل: [[[item1, item2, ...]]] → [item1, item2, ...]
+    items = _flatten_nested_lists(assets_payload)
+    if not isinstance(items, list):
+        return []
+
+    records: List[Dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, dict):
+            # صيغة dict
+            name = (item.get("asset") or item.get("name")
+                     or item.get("symbol") or item.get("code"))
+            if name:
+                records.append({
+                    "asset": name,
+                    "name": item.get("display_name") or item.get("label") or name,
+                    "type": item.get("type") or item.get("category"),
+                    "payout": item.get("payout") or item.get("profit")
+                              or item.get("sentiment"),
+                    "raw": item,
+                })
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            # صيغة Binolla tuple: [id, asset_code, display_name, type, group, payout, ...]
+            try:
+                rec = {
+                    "id": item[0] if len(item) > 0 else None,
+                    "asset": item[1] if len(item) > 1 else "",
+                    "name": item[2] if len(item) > 2 else item[1],
+                    "type": item[3] if len(item) > 3 else "",
+                    "group_id": item[4] if len(item) > 4 else None,
+                    "payout": item[5] if len(item) > 5 else None,
+                    "expire_at": item[13] if len(item) > 13 else None,
+                    "is_tradable": item[14] if len(item) > 14 else None,
+                    "precision": item[16] if len(item) > 16 else None,
+                    "step": item[17] if len(item) > 17 else None,
+                    "bid": item[18] if len(item) > 18 else None,
+                    "ask": item[19] if len(item) > 19 else None,
+                    "raw": list(item),
+                }
+                if rec["asset"]:
+                    records.append(rec)
+            except Exception as e:
+                logger.debug("Error parsing asset tuple: %s", e)
+    return records
+
+
+def _flatten_nested_lists(payload: Any) -> List[Any]:
+    """يأخذ payload ويفك أي تداخل حتى يصل إلى قائمة "الصفوف".
+
+    مثال:
+        [[[item1, item2], [item3]], ...]  →  [item1, item2, item3]
+        [item1, item2]                    →  [item1, item2]
+        [[[item1, item2, ...]]]           →  [item1, item2, ...]
+    """
+    if not isinstance(payload, list):
+        return []
+    if not payload:
+        return []
+    # تحقق من البند الأول — إن كان سجل أصل حقيقياً (dict أو list بطول ≥ 2)
+    # فالـ payload نفسه هو قائمة السجلات.
+    first = payload[0]
+    if isinstance(first, dict):
+        return payload
+    if isinstance(first, (list, tuple)) and len(first) >= 2:
+        # تحقق إن كان first هو tuple لأصل (يحتوي على str في index 1)
+        # أم هو قائمة من tuples (تداخل آخر).
+        if len(first) >= 2 and isinstance(first[1], (list, tuple)):
+            # first نفسها قائمة من tuples → قم بفك طبقة واحدة
+            flattened: List[Any] = []
+            for sub in payload:
+                if isinstance(sub, (list, tuple)):
+                    flattened.extend(sub)
+                else:
+                    flattened.append(sub)
+            return flattened
+        # first هي tuple لأصل حقيقي
+        return payload
+    # أي شيء آخر
     return []
 
 
@@ -3069,7 +3157,17 @@ class LivePriceStream:
 # SECTION 14.6: INTERACTIVE COMMAND PROCESSOR
 # ==============================================================================
 async def cmd_assets(client: "Binolla", live_stream: LivePriceStream) -> None:
-    """يجلب قائمة كل الأصول ويطبعها مع نسبة الدفع والسعر اللحظي بجوارها."""
+    """يجلب قائمة كل الأصول ويطبعها مع نسبة الدفع والسعر اللحظي بجوارها.
+
+    بنية payload من Binolla (كما التُقطت):
+        [[[442, '0700.HK_otc', '0700.HK (OTC)', 'stock', 3, 93, ...], ...]]
+    حيث:
+      [1] = asset code (مثل '0700.HK_otc')
+      [2] = display name (مثل '0700.HK (OTC)')
+      [3] = type (مثل 'stock', 'currency', 'crypto')
+      [5] = payout % (مدمج في tuple مباشرة!)
+      [18]/[19] = bid/ask
+    """
     if not client.api:
         print(f"{Colors.RED}API not connected.{Colors.RESET}")
         return
@@ -3084,29 +3182,72 @@ async def cmd_assets(client: "Binolla", live_stream: LivePriceStream) -> None:
         print(f"{Colors.RED}No assets received.{Colors.RESET}")
         return
     client.api.assets_list = payload
-    asset_names = _extract_asset_names(payload)
-    if not asset_names:
-        print(f"{Colors.RED}Could not extract asset names from payload.{Colors.RESET}")
-        print(f"{Colors.DIM}Payload preview: {str(payload)[:300]}{Colors.RESET}")
-        return
-    print(f"\n{Colors.GREEN}Total assets: {len(asset_names)}{Colors.RESET}")
-    print(f"\n{Colors.BOLD}{'#':<4} {'Asset':<22} {'Payout%':<10} {'Price':<20}{Colors.RESET}")
-    print(f"    {'-'*22} {'-'*10} {'-'*20}")
-    for i, name in enumerate(asset_names, 1):
-        sent = client.api.assets_sentiment.get(name, {})
-        payout = sent.get("sentiment") if isinstance(sent, dict) else None
+
+    # استخدم السجلات الكاملة (تدعم tuple format و dict format)
+    records = _extract_asset_records(payload)
+    if not records:
+        # fallback للأسماء فقط
+        asset_names = _extract_asset_names(payload)
+        if not asset_names:
+            print(f"{Colors.RED}Could not extract asset names from payload.{Colors.RESET}")
+            print(f"{Colors.DIM}Payload preview: {str(payload)[:300]}{Colors.RESET}")
+            return
+        # ابنِ سجلات بسيطة من الأسماء
+        records = [{"asset": name, "name": name, "type": "", "payout": None}
+                   for name in asset_names]
+
+    print(f"\n{Colors.GREEN}Total assets: {len(records)}{Colors.RESET}")
+
+    # تجميع حسب النوع للعرض
+    by_type: Dict[str, List[Dict[str, Any]]] = {}
+    for rec in records:
+        t = rec.get("type") or "other"
+        by_type.setdefault(t, []).append(rec)
+
+    print(f"\n{Colors.BOLD}By type:{Colors.RESET} " +
+          "  ".join(f"{t}={len(recs)}" for t, recs in sorted(by_type.items())))
+
+    print(f"\n{Colors.BOLD}{'#':<4} {'Asset':<22} {'Name':<24} {'Type':<10} "
+          f"{'Payout%':<10} {'Price':<15}{Colors.RESET}")
+    print(f"    {'-'*22} {'-'*24} {'-'*10} {'-'*10} {'-'*15}")
+    for i, rec in enumerate(records, 1):
+        name = rec.get("asset", "")
+        display = rec.get("name", name)[:22]
+        atype = rec.get("type", "")[:10]
+        # payout من السجل نفسه (من tuple) أو من sentiment المُلتقَط
+        payout = rec.get("payout")
+        if payout is None:
+            sent = client.api.assets_sentiment.get(name, {})
+            payout = sent.get("sentiment") if isinstance(sent, dict) else None
+        # السعر اللحظي
         quote = client.api.assets_quotes.get(name)
         price = None
         if isinstance(quote, dict):
-            for k in ("price", "value", "rate", "last"):
+            for k in ("price", "value", "rate", "last", "bid", "ask"):
                 if k in quote:
                     price = quote[k]; break
         elif isinstance(quote, (int, float)):
             price = float(quote)
+        # fallback لـ bid/ask من السجل نفسه
+        if price is None:
+            if rec.get("bid") is not None:
+                price = rec["bid"]
+            elif rec.get("ask") is not None:
+                price = rec["ask"]
         payout_str = f"{payout}%" if payout is not None else "—"
         price_str = f"{price}" if price is not None else "—"
-        print(f"  {i:<4} {name:<22} {payout_str:<10} {price_str:<20}")
-    print(f"\n{Colors.DIM}Tip: type 'payout <asset>' to subscribe + watch payout for one asset.{Colors.RESET}")
+        print(f"  {i:<4} {name:<22} {display:<24} {atype:<10} {payout_str:<10} {price_str:<15}")
+
+    # اعرض الإحصاءات النهائية
+    with_payout = sum(1 for r in records if r.get("payout") is not None)
+    with_price = sum(1 for r in records if (r.get("bid") is not None
+                                            or r.get("ask") is not None
+                                            or r["asset"] in client.api.assets_quotes))
+    print(f"\n{Colors.CYAN}Summary:{Colors.RESET} "
+          f"with_payout={with_payout}/{len(records)}  "
+          f"with_price={with_price}/{len(records)}")
+    print(f"{Colors.DIM}Tip: type 'watch <asset>' to focus live stream on one asset.{Colors.RESET}")
+    print(f"{Colors.DIM}     type 'candles EURUSD_otc 7 1' to fetch historical candles.{Colors.RESET}")
 
 
 async def cmd_payout(client: "Binolla", live_stream: LivePriceStream,
