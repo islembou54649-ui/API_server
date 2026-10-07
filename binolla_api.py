@@ -3361,20 +3361,102 @@ async def cmd_watch(live_stream: LivePriceStream,
         print(f"{Colors.CYAN}Live stream now watching: ALL assets{Colors.RESET}")
 
 
+async def cmd_prices_live(client: "Binolla", live_stream: LivePriceStream,
+                            asset_arg: Optional[str] = None) -> None:
+    """يبدأ بث سعر لحظي مستمر لأصل محدد.
+
+    الآلية:
+    1) يرسل asset/list/change للأصل المطلوب لتفعيل تدفق s_quotes/list الخاص به.
+    2) يشترك في sentiment (نسبة الدفع) للأصل.
+    3) يضبط LivePriceStream على متابعة هذا الأصل حصرياً.
+    4) يستأنف البث إن كان متوقفاً.
+    5) يطبع رسالة تأكيد + أول سعر محفوظ إن وُجد.
+
+    لإيقاف البث: اكتب 'stop' أو 'watch all' أو 'pause'.
+    """
+    if not client.api:
+        print(f"{Colors.RED}API not connected.{Colors.RESET}")
+        return
+    if not asset_arg:
+        print(f"{Colors.YELLOW}Usage: prices live <asset>{Colors.RESET}")
+        print(f"{Colors.DIM}Example: prices live XTIUSD_otc{Colors.RESET}")
+        print(f"{Colors.DIM}         prices live EURUSD_otc{Colors.RESET}")
+        return
+    asset = asset_arg.strip()
+    print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
+    print(f"{Colors.BOLD}  Starting LIVE price stream for: {asset}{Colors.RESET}")
+    print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
+
+    # 1) فعّل تدفق quotes للأصل عبر asset/list/change
+    try:
+        client.api.change_asset(asset, period=60)
+        logmsg(f"Sent asset/list/change for {asset} (period=60)")
+    except Exception as e:
+        logmsg(f"{Colors.YELLOW}change_asset warning: {e}{Colors.RESET}")
+
+    # 2) اشترك في sentiment للأصل
+    try:
+        client.api.subscribe_asset_sentiment(asset)
+        logmsg(f"Subscribed to sentiment for {asset}")
+    except Exception as e:
+        logger.debug("subscribe_asset_sentiment err: %s", e)
+
+    # 3) اطلب quotes فوراً
+    try:
+        client.api.subscribe_quotes()
+    except Exception as e:
+        logger.debug("subscribe_quotes err: %s", e)
+
+    # 4) اضبط البث على هذا الأصل حصرياً + استأنف
+    live_stream.set_watch(asset)
+    live_stream.resume()
+
+    # 5) اطبع أول سعر محفوظ إن وُجد
+    existing_quote = client.api.assets_quotes.get(asset)
+    if existing_quote:
+        price = None
+        if isinstance(existing_quote, dict):
+            for k in ("price", "value", "rate", "last", "bid", "ask"):
+                if k in existing_quote:
+                    price = existing_quote[k]; break
+        elif isinstance(existing_quote, (int, float)):
+            price = float(existing_quote)
+        if price is not None:
+            print(f"{Colors.GREEN}Current cached price: {price}{Colors.RESET}")
+        else:
+            print(f"{Colors.DIM}Waiting for first live quote...{Colors.RESET}")
+    else:
+        print(f"{Colors.DIM}Waiting for first live quote (should arrive within 1-3s)...{Colors.RESET}")
+
+    # اطبع نسبة الدفع المحفوظة إن وُجدت
+    existing_sent = client.api.assets_sentiment.get(asset, {})
+    if isinstance(existing_sent, dict):
+        payout = existing_sent.get("sentiment")
+        if payout is not None:
+            print(f"{Colors.YELLOW}Current payout: {payout}%{Colors.RESET}")
+
+    print(f"\n{Colors.DIM}Live prices will stream below. Type 'stop' to return to normal.{Colors.RESET}")
+    print(f"{Colors.DIM}Or type any other command — stream continues in background.{Colors.RESET}\n")
+
+
 def print_help() -> None:
     """يطبع قائمة الأوامر المتاحة."""
     print(f"\n{Colors.BOLD}Available commands:{Colors.RESET}")
-    print(f"  {Colors.CYAN}assets{Colors.RESET}                  Fetch + print all assets with payout% and price")
-    print(f"  {Colors.CYAN}payout [asset]{Colors.RESET}          Print payout% for all (or one) asset")
-    print(f"  {Colors.CYAN}prices{Colors.RESET}                   Print current cached live prices")
-    print(f"  {Colors.CYAN}candles <asset> <d> <tf>{Colors.RESET} Fetch candles (e.g. 'candles EURUSD_otc 7 1')")
-    print(f"  {Colors.CYAN}watch <asset>{Colors.RESET}           Focus live stream on one asset")
-    print(f"  {Colors.CYAN}watch all{Colors.RESET}               Stream all assets (default)")
-    print(f"  {Colors.CYAN}pause{Colors.RESET}                   Pause live price stream")
-    print(f"  {Colors.CYAN}resume{Colors.RESET}                  Resume live price stream")
-    print(f"  {Colors.CYAN}snapshot{Colors.RESET}                 Save JSON snapshot of all assets+payout+price")
-    print(f"  {Colors.CYAN}help{Colors.RESET}                    Show this help")
-    print(f"  {Colors.CYAN}quit{Colors.RESET}                    Exit")
+    print(f"  {Colors.CYAN}assets{Colors.RESET}                          Fetch + print all assets with payout% and price")
+    print(f"  {Colors.CYAN}payout [asset]{Colors.RESET}                  Print payout% for all (or one) asset")
+    print(f"  {Colors.CYAN}prices{Colors.RESET}                           Print current cached live prices (all assets)")
+    print(f"  {Colors.CYAN}prices live <asset>{Colors.RESET}             Start continuous live price stream for one asset")
+    print(f"  {Colors.DIM}    example: prices live XTIUSD_otc{Colors.RESET}")
+    print(f"  {Colors.DIM}             prices live EURUSD_otc{Colors.RESET}")
+    print(f"  {Colors.CYAN}stop{Colors.RESET}                            Stop live stream + return to all-assets mode")
+    print(f"  {Colors.CYAN}candles <asset> <d> <tf>{Colors.RESET}       Fetch candles (e.g. 'candles EURUSD_otc 7 1')")
+    print(f"  {Colors.CYAN}watch <asset>{Colors.RESET}                   Focus live stream on one asset (alias for 'prices live')")
+    print(f"  {Colors.CYAN}watch all{Colors.RESET}                       Stream all assets (default)")
+    print(f"  {Colors.CYAN}pause{Colors.RESET}                           Pause live price stream")
+    print(f"  {Colors.CYAN}resume{Colors.RESET}                          Resume live price stream")
+    print(f"  {Colors.CYAN}snapshot{Colors.RESET}                         Save JSON snapshot of all assets+payout+price")
+    print(f"  {Colors.CYAN}help{Colors.RESET}                            Show this help")
+    print(f"  {Colors.CYAN}quit{Colors.RESET}                            Exit")
     print()
 
 
@@ -3397,7 +3479,18 @@ async def process_command(cmd_line: str, client: "Binolla",
     elif cmd == "payout":
         await cmd_payout(client, live_stream, rest[0] if rest else None)
     elif cmd == "prices":
-        await cmd_prices(client)
+        #prices                 → طباعة كل الأسعار المخزنة
+        #prices live <asset>    → بدء بث لحظي مستمر لأصل واحد
+        if rest and rest[0].lower() == "live":
+            asset_arg = rest[1] if len(rest) > 1 else None
+            await cmd_prices_live(client, live_stream, asset_arg)
+        else:
+            await cmd_prices(client)
+    elif cmd == "stop":
+        # أوقف بث الأصل الفردي + عُ إلى وضع كل الأصول
+        live_stream.set_watch(None)
+        live_stream.stop()
+        print(f"{Colors.YELLOW}Live stream stopped. Type 'resume' or 'prices live <asset>' to restart.{Colors.RESET}")
     elif cmd == "candles":
         if len(rest) < 3:
             print(f"{Colors.YELLOW}Usage: candles <asset> <days> <timeframe>{Colors.RESET}")
@@ -3411,7 +3504,16 @@ async def process_command(cmd_line: str, client: "Binolla",
             except ValueError:
                 print(f"{Colors.RED}days and timeframe must be integers.{Colors.RESET}")
     elif cmd == "watch":
-        await cmd_watch(live_stream, rest[0] if rest else None)
+        # watch <asset>  →  alias لـ prices live <asset>
+        # watch all      →  بث كل الأصول
+        if rest and rest[0].lower() == "all":
+            live_stream.set_watch(None)
+            live_stream.resume()
+            print(f"{Colors.CYAN}Live stream now watching: ALL assets{Colors.RESET}")
+        elif rest:
+            await cmd_prices_live(client, live_stream, rest[0])
+        else:
+            print(f"{Colors.YELLOW}Usage: watch <asset>  or  watch all{Colors.RESET}")
     elif cmd == "pause":
         live_stream.stop()
         print(f"{Colors.YELLOW}Live price stream paused.{Colors.RESET}")
