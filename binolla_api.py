@@ -917,6 +917,52 @@ class BinollaWebsocketClient:
             except Exception:
                 pass
 
+        # ===== sentiment / payout (نسبة الدفع) =====
+        # s_asset/sentiment: {"asset":"AUDCHF_otc","sentiment":17}
+        # هذا الحدث يحمل نسبة الدفع (payout %) لكل أصل
+        if event_name == "s_asset/sentiment" and decoded_args:
+            try:
+                payload = decoded_args[0]
+                if isinstance(payload, list) and payload:
+                    for item in payload:
+                        if isinstance(item, dict) and "asset" in item:
+                            self.api.assets_sentiment[item["asset"]] = item
+                elif isinstance(payload, dict) and "asset" in payload:
+                    self.api.assets_sentiment[payload["asset"]] = payload
+            except Exception as e:
+                logger.debug("Error storing s_asset/sentiment: %s", e)
+
+        # ===== signals (إشارات الدفع لفريمات زمنية مختلفة) =====
+        if event_name == "s_signals/asset/change" and decoded_args:
+            try:
+                payload = decoded_args[0]
+                if isinstance(payload, list):
+                    for item in payload:
+                        if isinstance(item, dict) and "asset" in item:
+                            asset_name = item["asset"]
+                            tf = item.get("timeframe", 0)
+                            self.api.assets_signals.setdefault(asset_name, {})[tf] = item
+                elif isinstance(payload, dict) and "asset" in payload:
+                    asset_name = payload["asset"]
+                    tf = payload.get("timeframe", 0)
+                    self.api.assets_signals.setdefault(asset_name, {})[tf] = payload
+            except Exception as e:
+                logger.debug("Error storing s_signals/asset/change: %s", e)
+
+        # ===== quotes list (الأسعار اللحظية) =====
+        # يمكن أن يصل كـ "s_quotes/list" مع list of {asset, price, ...}
+        if event_name == "s_quotes/list" and decoded_args:
+            try:
+                payload = decoded_args[0]
+                if isinstance(payload, list):
+                    for item in payload:
+                        if isinstance(item, dict) and "asset" in item:
+                            self.api.assets_quotes[item["asset"]] = item
+                elif isinstance(payload, dict) and "asset" in payload:
+                    self.api.assets_quotes[payload["asset"]] = payload
+            except Exception as e:
+                logger.debug("Error storing s_quotes/list: %s", e)
+
     # ---- إرسال الـ authorization بعد الـ connect ----
     def _send_authorization(self) -> None:
         token = self.state.SSID or self.api.token
@@ -1085,6 +1131,17 @@ class BinollaAPI:
         self.history_last: Any = None
         self.history_regions: Dict[int, Any] = {}  # {index: payload} — لجلب الشموع المتوازي
         self.realtime_quotes: Any = None
+
+        # ===== بيانات الأصول المُجمّعة =====
+        # assets_sentiment: {asset_name: {"asset":..., "sentiment":17, ...}}
+        # sentiment = نسبة الدفع (payout %) لكل أصل
+        self.assets_sentiment: Dict[str, Any] = {}
+        # assets_signals: {asset_name: {timeframe: signal_dict}}
+        # signals = إشارات الدفع لفريمات زمنية مختلفة (M1, M5, M15)
+        self.assets_signals: Dict[str, Dict[int, Any]] = {}
+        # assets_quotes: {asset_name: {"asset":..., "price":..., "time":...}}
+        # quotes = السعر اللحظي لكل أصل
+        self.assets_quotes: Dict[str, Any] = {}
 
         # Event Registry
         self.event_registry = EventRegistry()
@@ -1256,6 +1313,53 @@ class BinollaAPI:
     def subscribe_quotes(self) -> None:
         """يشترك في بث الاقتباسات اللحظية (s_quotes/list)."""
         self.send_websocket_request('42["quotes/list"]')
+
+    # ===== دوال sentiment / signals / payout =====
+    def subscribe_global_sentiment(self) -> None:
+        """يشترك في بث sentiment لكل الأصول (s_asset/sentiment).
+
+        بعد الاشتراك، يصل حدث:
+            ["s_asset/sentiment", {"asset":"AUDCHF_otc","sentiment":17}]
+        حيث sentiment = نسبة الدفع (payout %) لكل أصل.
+        """
+        self.send_websocket_request('42["s_asset/sentiment/subscribe"]')
+
+    def subscribe_asset_sentiment(self, asset: str) -> None:
+        """يشترك في sentiment (نسبة الدفع) لأصل محدد.
+
+        مرسل من المتصفح: ["asset/sentiment/subscribe", "AUDCHF_otc"]
+        الاستجابة: ["s_asset/sentiment", {"asset":"AUDCHF_otc","sentiment":17}]
+        """
+        data = '42["asset/sentiment/subscribe",' + json.dumps(asset, separators=(",", ":")) + ']'
+        self.send_websocket_request(data)
+
+    def subscribe_asset_signals(self, asset: str,
+                                  timeframes: Optional[List[int]] = None) -> None:
+        """يشترك في إشارات الأصل لفريمات زمنية متعددة.
+
+        مرسل من المتصفح (مثال):
+          ["s_signals/asset/subscribe",[
+              {"asset":"AUDCHF_otc","timeframe":120,"cmd":1,"expire":1791371760},
+              {"asset":"AUDCHF_otc","timeframe":600,"cmd":1,"expire":1791372000},
+              {"asset":"AUDCHF_otc","timeframe":900,"cmd":1,"expire":1791371700}
+          ]]
+
+        الاستجابة:
+          ["s_signals/asset/change", [{"asset":"AUDCHF_otc","timeframe":900,"cmd":1,"expire":...}]]
+        """
+        if timeframes is None:
+            timeframes = [60, 120, 300, 600, 900]
+        now = int(time.time())
+        items = []
+        for tf in timeframes:
+            items.append({
+                "asset": asset,
+                "timeframe": int(tf),
+                "cmd": 1,
+                "expire": now + int(tf),
+            })
+        data = '42["s_signals/asset/subscribe",' + json.dumps(items, separators=(",", ":")) + ']'
+        self.send_websocket_request(data)
 
     def fetch_assets(self) -> None:
         self.send_websocket_request('42["assets/list"]')
@@ -2358,21 +2462,285 @@ async def prompt_email_password() -> Tuple[Optional[str], Optional[str]]:
 
 
 # ==============================================================================
+# SECTION 13.5: AUTO-LOGIN + ASSET INFO FETCHER (no interactive prompts)
+# ==============================================================================
+async def auto_login(args: Dict[str, Any]) -> Optional[str]:
+    """يسجّل الدخول تلقائياً (بدون أي أسئلة تفاعلية) وفق المنطق التالي:
+
+    1) إذا وُجد توكن في CLI/env ولم ينتهِ، استخدمه مباشرة.
+    2) وإلا حمّل credentials.json:
+       - إن وُجد JWT صالح هناك، استخدمه.
+       - وإلا إن وُجد email/password، أعد تسجيل الدخول عبر HTTP Login.
+    3) إن لم ينجح أي شيء، أعد None.
+
+    لا يطلب أي إدخال من المستخدم.
+    """
+    token = args.get("token", "")
+    email = args.get("email", "")
+    password = args.get("password", "")
+
+    # 1) توكن من CLI — إن وُجد ولم ينتهِ
+    if token and not is_token_expired(token):
+        logmsg(f"{Colors.GREEN}Using CLI-provided JWT (still valid).{Colors.RESET}")
+        return token
+
+    # 2) حمّل credentials.json
+    creds = load_credentials()
+    if creds:
+        if creds.get("token") and not is_token_expired(creds["token"]):
+            logmsg(f"{Colors.GREEN}Using saved JWT from credentials.json (still valid).{Colors.RESET}")
+            # املأ email/password من الاعتمادات المحفوظة لاستخدامها لاحقاً عند انتهاء الصلاحية
+            if not email and creds.get("email"):
+                args["email"] = creds["email"]
+            if not password and creds.get("password"):
+                args["password"] = creds["password"]
+            return creds["token"]
+
+        # الـ JWT منتهٍ — جرّب إعادة الدخول عبر email/password
+        if creds.get("email") and creds.get("password"):
+            logmsg(f"{Colors.YELLOW}Saved JWT expired — re-logging in via HTTP...{Colors.RESET}")
+            args["email"] = creds["email"]
+            args["password"] = creds["password"]
+            return await _http_login(args)
+
+    # 3) إن وُجد email/password من CLI/env — سجّل الدخول
+    if email and password:
+        logmsg(f"Logging in as {email} via HTTP (qx__1.py-style)...")
+        return await _http_login(args)
+
+    logmsg(f"{Colors.RED}No credentials available. "
+           f"Set BINOLLA_EMAIL+BINOLLA_PASSWORD or BINOLLA_TOKEN env vars, "
+           f"or run once interactively to populate credentials.json.{Colors.RESET}")
+    return None
+
+
+async def _http_login(args: Dict[str, Any]) -> Optional[str]:
+    """ينفّذ تسجيل الدخول عبر HTTP Login ويعيد التوكن أو None."""
+    email = args.get("email", "")
+    password = args.get("password", "")
+    if not (email and password):
+        return None
+
+    from types import SimpleNamespace
+    proxy_dict = None
+    if args.get("proxies"):
+        proxy_dict = {"http": args["proxies"], "https": args["proxies"]}
+
+    login_api = SimpleNamespace(
+        host=HOST, https_url=ORIGIN_URL, lang="en",
+        session_data={"user_agent": USER_AGENT, "cookies": ""},
+        _normalize_proxies=(lambda x: {"http": x, "https": x} if x else None),
+        proxies=args.get("proxies") or None,
+    )
+    login = Login(login_api, proxies=proxy_dict)
+    try:
+        ok, jwt_or_err = await login(email, password)
+    except Exception as e:
+        logmsg(f"{Colors.RED}HTTP login exception: {e}{Colors.RESET}")
+        return None
+    if not ok:
+        logmsg(f"{Colors.RED}HTTP login failed: {jwt_or_err}{Colors.RESET}")
+        logmsg(f"{Colors.YELLOW}Hint: Binolla uses Cloudflare Turnstile on /login. "
+               f"Try logging in via browser once and copy the JWT from DevTools → "
+               f"Application → Local Storage → 'token' key.{Colors.RESET}")
+        return None
+    logmsg(f"{Colors.GREEN}Got JWT from HTTP login.{Colors.RESET}")
+    return jwt_or_err
+
+
+# ==============================================================================
+# SECTION 13.6: ASSETS + PAYOUT + LIVE PRICE FETCHER
+# ==============================================================================
+def _extract_asset_names(assets_payload: Any) -> List[str]:
+    """يستخرج أسماء الأصول من حملة s_assets/list بأي صيغة محتملة.
+
+    الصيغ المدعومة:
+      - ["EURUSD_otc", "GBPUSD_otc", ...]               (قائمة أسماء)
+      - [{"asset":"EURUSD_otc",...}, ...]                (قائمة dicts)
+      - {"assets":[{"asset":"EURUSD_otc",...}, ...]}     (dict مع مفتاح assets)
+      - {"EURUSD_otc":{...}, "GBPUSD_otc":{...}}          (dict بأسماء الأصول كمفاتيح)
+    """
+    if assets_payload is None:
+        return []
+    # قائمة أسماء نصية
+    if isinstance(assets_payload, list):
+        names = []
+        for item in assets_payload:
+            if isinstance(item, str):
+                names.append(item)
+            elif isinstance(item, dict):
+                name = item.get("asset") or item.get("name") or item.get("symbol")
+                if name:
+                    names.append(name)
+        return names
+    # dict
+    if isinstance(assets_payload, dict):
+        # ابحث عن مفتاح قائمة معروف
+        for key in ("assets", "data", "list", "items"):
+            if key in assets_payload and isinstance(assets_payload[key], list):
+                return _extract_asset_names(assets_payload[key])
+        # كل المفاتيح هي أسماء الأصول
+        names = []
+        for k, v in assets_payload.items():
+            if isinstance(k, str) and not k.startswith("_"):
+                names.append(k)
+        return names
+    return []
+
+
+def _normalize_asset_for_quote(name: str) -> str:
+    """يُعيد اسم الأصل بصيغة موحدة للاقتران مع quotes/sentiment."""
+    if not name:
+        return ""
+    s = name.strip()
+    return s
+
+
+def save_assets_info_to_json(payload: Dict[str, Any],
+                              out_path: Optional[Path] = None) -> Path:
+    """يحفظ بيانات الأصول (الاسم، نسبة الدفع، السعر اللحظي) في ملف JSON."""
+    if out_path is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = DATA_DIR / f"assets_info_{ts}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False,
+                                    default=str))
+    return out_path
+
+
+async def fetch_all_assets_info(client: "Binolla",
+                                 wait_seconds: float = 8.0) -> Dict[str, Any]:
+    """يجلب كل الأصول المتوفرة + نسبة الدفع + السعر اللحظي.
+
+    الخطوات:
+      1) يطلب assets/list وينتظر s_assets/list.
+      2) يشترك في sentiment العام (s_asset/sentiment/subscribe).
+      3) لكل أصل، يُرسل asset/sentiment/subscribe وasset/list/change وquotes/list
+         لجلب نسبة الدفع والسعر اللحظي.
+      4) ينتظر wait_seconds لتجميع كل التحديثات.
+      5) يجمع النتائج في قائمة dicts.
+
+    النتيجة:
+        {
+          "fetched_at": <unix_ts>,
+          "assets_count": N,
+          "assets": [
+            {"asset":"EURUSD_otc", "payout":17, "price":1.0823, "signals":{...}, "raw":{...}},
+            ...
+          ]
+        }
+    """
+    api = client.api
+    if not api:
+        return {"error": "API not connected", "assets": []}
+
+    # 1) اطلب قائمة الأصول (وإن لم تصل بعد)
+    logmsg(f"{Colors.CYAN}Requesting assets/list...{Colors.RESET}")
+    await api.event_registry.clear_event("s_assets/list")
+    api.fetch_assets()
+    assets_payload = await api.event_registry.wait_event(
+        "s_assets/list", timeout=10.0)
+    if not assets_payload:
+        # ربما وصلت تلقائياً بعد المصادقة
+        assets_payload = api.assets_list
+    if not assets_payload:
+        logmsg(f"{Colors.RED}No assets/list received.{Colors.RESET}")
+        return {"error": "no assets/list", "assets": []}
+
+    api.assets_list = assets_payload
+    asset_names = _extract_asset_names(assets_payload)
+    logmsg(f"{Colors.GREEN}Got {len(asset_names)} assets.{Colors.RESET}")
+    logger.debug("First 10 assets: %s", asset_names[:10])
+
+    # 2) اشترك في sentiment العام (يصل لكل الأصول تدريجياً)
+    logmsg(f"{Colors.CYAN}Subscribing to global sentiment (s_asset/sentiment)...{Colors.RESET}")
+    api.subscribe_global_sentiment()
+
+    # 3) لكل أصل، اشترك في sentiment + quotes + signals
+    #    نرسل بشكل دفعي لكن بفاصل قصير لتفادي الـ rate-limiting.
+    logmsg(f"{Colors.CYAN}Subscribing per-asset sentiment + quotes + signals "
+           f"({len(asset_names)} assets)...{Colors.RESET}")
+    BATCH = 25
+    for i in range(0, len(asset_names), BATCH):
+        batch = asset_names[i:i + BATCH]
+        for name in batch:
+            try:
+                api.subscribe_asset_sentiment(name)
+            except Exception as e:
+                logger.debug("subscribe_asset_sentiment(%s) err: %s", name, e)
+            try:
+                # نشترك في signals لفريمات شائعة
+                api.subscribe_asset_signals(name, timeframes=[60, 300, 900])
+            except Exception as e:
+                logger.debug("subscribe_asset_signals(%s) err: %s", name, e)
+        # طلب quotes/list لتحديث الأسعار اللحظية لكل الأصول
+        try:
+            api.subscribe_quotes()
+        except Exception as e:
+            logger.debug("subscribe_quotes err: %s", e)
+        # فاصل قصير بين الدفعات
+        await asyncio.sleep(0.3)
+
+    # 4) انتظر تجميع التحديثات
+    logmsg(f"{Colors.CYAN}Waiting {wait_seconds:.1f}s to collect sentiment + quotes...{Colors.RESET}")
+    await asyncio.sleep(wait_seconds)
+
+    # 5) اجمع النتائج
+    assets_info: List[Dict[str, Any]] = []
+    for name in asset_names:
+        sentiment_data = api.assets_sentiment.get(name, {})
+        payout = None
+        if isinstance(sentiment_data, dict):
+            payout = sentiment_data.get("sentiment",
+                                         sentiment_data.get("payout",
+                                         sentiment_data.get("profit")))
+        quote_data = api.assets_quotes.get(name)
+        price = None
+        if isinstance(quote_data, dict):
+            for k in ("price", "value", "rate", "last"):
+                if k in quote_data:
+                    price = quote_data[k]
+                    break
+        elif isinstance(quote_data, (int, float)):
+            price = float(quote_data)
+        signals = api.assets_signals.get(name, {})
+        assets_info.append({
+            "asset": name,
+            "payout": payout,
+            "price": price,
+            "signals": {str(k): v for k, v in signals.items()},
+            "sentiment_raw": sentiment_data,
+            "quote_raw": quote_data,
+        })
+
+    return {
+        "fetched_at": int(time.time()),
+        "assets_count": len(assets_info),
+        "assets": assets_info,
+    }
+
+
+# ==============================================================================
 # SECTION 14: COMMAND-LINE INTERFACE
 # ==============================================================================
 def parse_args() -> Dict[str, Any]:
-    """معالجة بسيطة لوسائط سطر الأوامر."""
+    """معالجة بسيطة لوسائط سطر الأوامر.
+
+    الافتراضي: DEMO account (بدون أي أسئلة تفاعلية).
+    استخدم --real للتبديل إلى حساب حقيقي.
+    """
     args = {
         "token": os.environ.get("BINOLLA_TOKEN", ""),
         "email": os.environ.get("BINOLLA_EMAIL", ""),
         "password": os.environ.get("BINOLLA_PASSWORD", ""),
-        "asset": os.environ.get("BINOLLA_ASSET", "EURUSD_otc"),
-        "days": int(os.environ.get("BINOLLA_DAYS", "7")),
+        "asset": os.environ.get("BINOLLA_ASSET", ""),
+        "days": int(os.environ.get("BINOLLA_DAYS", "0")),
         "timeframe": int(os.environ.get("BINOLLA_TIMEFRAME", "1")),
+        # الافتراضي: DEMO (السلوك المطلوب من المستخدم)
         "is_demo": os.environ.get("BINOLLA_ACCOUNT", "demo").lower() != "real",
         "proxies": os.environ.get("BINOLLA_PROXY", ""),
         "headless": os.environ.get("BINOLLA_HEADLESS", "0") == "1",
-        "non_interactive": False,
+        "non_interactive": True,   # دائماً non-interactive الآن
     }
     # وسيطات سطر الأوامر البسيطة
     rest = sys.argv[1:]
@@ -2409,164 +2777,45 @@ def parse_args() -> Dict[str, Any]:
 
 
 # ==============================================================================
-# SECTION 15: MAIN INTERACTIVE LOOP
+# SECTION 15: MAIN LOOP (no interactive prompts — auto login + assets fetch)
 # ==============================================================================
 async def main_async():
+    """التدفق الرئيسي الجديد — بدون أي أسئلة تفاعلية:
+
+    1) يحمّل credentials.json تلقائياً
+    2) إن وُجد JWT صالح يستخدمه، وإلا يعيد تسجيل الدخول بالإيميل/كلمة السر
+    3) يتصل مباشرة بحساب DEMO
+    4) يجلب كل الأصول المتوفرة + نسبة الدفع + السعر اللحظي
+    5) يحفظ النتيجة في JSON ويعرض ملخصاً
+    """
     args = parse_args()
     print_banner()
 
-    # ===== 1) حدّد طريقة المصادقة =====
-    token = args["token"]
-    email = args["email"]
-    password = args["password"]
-
-    # جرّب credentials.json إن لم يُمرّر شيء
-    if not token and not (email and password):
-        creds = load_credentials()
-        if creds:
-            print(f"{Colors.GREEN}Found saved credentials "
-                  f"(saved at {datetime.fromtimestamp(creds.get('saved_at', 0)).isoformat()}).{Colors.RESET}")
-            if creds.get("token") and not is_token_expired(creds["token"]):
-                print(f"  {Colors.DIM}Saved JWT still valid.{Colors.RESET}")
-            elif creds.get("token"):
-                print(f"  {Colors.YELLOW}Saved JWT expired — will re-login.{Colors.RESET}")
-
-            # اختر الطريقة
-            if creds.get("email") and creds.get("password"):
-                print(f"  Saved email: {creds['email']}")
-            use_choice = (await ainput(
-                f"{Colors.YELLOW}Choose: [J]=use saved JWT, [E]=re-login with email/password, "
-                f"[N]=new JWT paste, (J/e/n): {Colors.RESET}"
-            )).strip().lower() if not args["non_interactive"] else "j"
-
-            if use_choice in ('n', 'N'):
-                token = await prompt_token()
-                if token is None:
-                    return
-            elif use_choice == "e":
-                if not (creds.get("email") and creds.get("password")):
-                    email, password = await prompt_email_password()
-                    if email is None:
-                        return
-                else:
-                    email = creds["email"]
-                    password = creds["password"]
-            else:  # default J
-                if creds.get("token") and not is_token_expired(creds["token"]):
-                    token = creds["token"]
-                    args["is_demo"] = creds.get("is_demo", True)
-                elif creds.get("email") and creds.get("password"):
-                    # الـ JWT منتهٍ لكن لدينا إيميل/كلمة مرور — أعد الدخول
-                    print(f"  {Colors.YELLOW}Saved JWT expired — re-logging in via browser...{Colors.RESET}")
-                    email = creds["email"]
-                    password = creds["password"]
-                else:
-                    # لا JWT ولا إيميل — اطلب JWT
-                    token = await prompt_token()
-                    if token is None:
-                        return
-        else:
-            # لا توجد اعتمادات محفوظة — اسأل المستخدم
-            if args["non_interactive"]:
-                print(f"{Colors.RED}No credentials provided. Set BINOLLA_TOKEN or "
-                      f"BINOLLA_EMAIL+BINOLLA_PASSWORD env vars.{Colors.RESET}")
-                return
-            choice = (await ainput(
-                f"{Colors.YELLOW}Choose authentication: [J]=paste JWT, "
-                f"[E]=email+password via browser, (J/e): {Colors.RESET}"
-            )).strip().lower()
-            if choice == "e":
-                email, password = await prompt_email_password()
-                if email is None:
-                    return
-            else:
-                token = await prompt_token()
-                if token is None:
-                    return
-
-    # إذا قُدّم الإيميل فقط (بدون كلمة مرور) — اطلبها
-    if email and not password and not args["non_interactive"]:
-        password = (await ainput(
-            f"{Colors.YELLOW}Password for {email}: {Colors.RESET}"
-        )).strip()
-        if not password:
-            return
-    if password and not email and not args["non_interactive"]:
-        email = (await ainput(
-            f"{Colors.YELLOW}Email: {Colors.RESET}"
-        )).strip()
-        if not email:
-            return
-
-    # ===== 2) إن وُجد إيميل/كلمة مرور (ولم يُمرّر JWT) — سجّل الدخول عبر HTTP =====
-    if email and password and not token:
-        logmsg(f"Logging in as {email} via HTTP (qx__1.py-style)...")
-        # أنشئ كائن Login مرتبط بـ API وهمي (سنبني API الحقيقي بعد استخراج التوكن)
-        from types import SimpleNamespace
-        proxy_dict = None
-        if args["proxies"]:
-            from urllib.parse import urlparse
-            p = urlparse(args["proxies"])
-            if p.hostname and p.port:
-                proxy_dict = {"http": args["proxies"], "https": args["proxies"]}
-        login_api = SimpleNamespace(
-            host=HOST, https_url=ORIGIN_URL, lang="en",
-            session_data={"user_agent": USER_AGENT, "cookies": ""},
-            _normalize_proxies=staticmethod(lambda x: {"http": x, "https": x} if x else None)
-            if False else (lambda x: {"http": x, "https": x} if x else None),
-            proxies=args["proxies"] or None,
-        )
-        login = Login(login_api, proxies=proxy_dict)
-        try:
-            ok, jwt_or_err = await login(email, password)
-        except Exception as e:
-            ok, jwt_or_err = False, f"HTTP login exception: {e}"
-        if not ok:
-            print(f"{Colors.RED}HTTP login failed: {jwt_or_err}{Colors.RESET}")
-            print(f"{Colors.YELLOW}Hint: Binolla uses Cloudflare Turnstile on /login.{Colors.RESET}")
-            print(f"{Colors.YELLOW}      If HTTP login fails, paste a JWT manually (extract from DevTools → "
-                  f"Application → Local Storage → 'token' key).{Colors.RESET}")
-            # Fallback: اطلب JWT يدوياً
-            token = await prompt_token()
-            if token is None:
-                return
-        else:
-            token = jwt_or_err
-            logmsg(f"{Colors.GREEN}Got JWT from HTTP login.{Colors.RESET}")
-
+    # ===== 1) تسجيل دخول تلقائي (بدون أسئلة) =====
+    # فرض DEMO ما لم يُمرّر المستخدم --real صراحةً
+    args["is_demo"] = not (args.get("is_demo") is False)
+    logmsg(f"{Colors.CYAN}Auto-login: loading credentials.json...{Colors.RESET}")
+    token = await auto_login(args)
     if not token:
-        print(f"{Colors.RED}No token available.{Colors.RESET}")
+        logmsg(f"{Colors.RED}Cannot proceed without a valid JWT. Exiting.{Colors.RESET}")
         return
 
-    # تحقق من صلاحية التوكن
+    email = args.get("email", "")
+    password = args.get("password", "")
+
+    # تحقق نهائي من الصلاحية
     if is_token_expired(token):
-        print(f"{Colors.YELLOW}Warning: JWT appears expired. WebSocket auth may fail.{Colors.RESET}")
+        logmsg(f"{Colors.YELLOW}JWT appears expired — attempting re-login...{Colors.RESET}")
         if email and password:
-            logmsg("Re-logging in via HTTP...")
-            from types import SimpleNamespace
-            proxy_dict = None
-            if args["proxies"]:
-                proxy_dict = {"http": args["proxies"], "https": args["proxies"]}
-            login_api = SimpleNamespace(
-                host=HOST, https_url=ORIGIN_URL, lang="en",
-                session_data={"user_agent": USER_AGENT, "cookies": ""},
-                _normalize_proxies=(lambda x: {"http": x, "https": x} if x else None),
-                proxies=args["proxies"] or None,
-            )
-            login = Login(login_api, proxies=proxy_dict)
-            try:
-                ok, jwt_or_err = await login(email, password)
-                if ok:
-                    token = jwt_or_err
-            except Exception:
-                pass
+            token = await _http_login(args)
+            if not token:
+                logmsg(f"{Colors.RED}Re-login failed. Exiting.{Colors.RESET}")
+                return
+        else:
+            logmsg(f"{Colors.RED}No email/password to re-login. Exiting.{Colors.RESET}")
+            return
 
-    # ===== 3) نوع الحساب =====
-    if not args["non_interactive"]:
-        is_demo = await prompt_account_type()
-        args["is_demo"] = is_demo
-
-    # ===== 4) الاتصال =====
+    # ===== 2) الاتصال بحساب DEMO =====
     logmsg(f"Connecting to Binolla ({'demo' if args['is_demo'] else 'real'} account)...")
     client = await connect_binolla(token, is_demo=args["is_demo"],
                                    max_attempts=3, proxies=args["proxies"] or None)
@@ -2574,7 +2823,7 @@ async def main_async():
         print(f"\n{Colors.RED}Connection failed after multiple attempts.{Colors.RESET}")
         return
 
-    # حفظ الاعتمادات (JWT + إيميل/كلمة مرور إن وُجدت)
+    # حفظ الاعتمادات المُحدّثة
     save_credentials(
         token=token,
         email=email,
@@ -2588,57 +2837,78 @@ async def main_async():
     stop_keepalive = asyncio.Event()
     keepalive_task = asyncio.create_task(keepalive_loop(client, stop_keepalive))
 
-    # ملاحظة: لا نُرسل طلبات أولية إضافية — الخادم يُرسل تلقائياً بعد المصادقة:
-    #   s_assets/list, s_settings/list, s_balances/list, s_history/last, s_quotes/list
-    # ننتظر مباشرةً إدخال المستخدم لاسم العملة والفريم وعدد الأيام.
-
     try:
-        fetch_count = 0
-        while True:
+        # ===== 3) جلب كل الأصول + نسبة الدفع + السعر اللحظي =====
+        print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
+        print(f"{Colors.BOLD}  Fetching all assets + payout % + live prices{Colors.RESET}")
+        print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
+
+        result = await fetch_all_assets_info(client, wait_seconds=10.0)
+
+        if "error" in result:
+            print(f"{Colors.RED}Error: {result['error']}{Colors.RESET}")
+        else:
+            assets = result.get("assets", [])
+            print(f"\n{Colors.GREEN}Fetched {len(assets)} assets.{Colors.RESET}")
+
+            # اعرض جدول ملخص لأول 30 أصل
+            print(f"\n{Colors.BOLD}Sample (first 30):{Colors.RESET}")
+            print(f"  {'Asset':<20} {'Payout%':<10} {'Price':<15}")
+            print(f"  {'-'*20} {'-'*10} {'-'*15}")
+            for a in assets[:30]:
+                payout = a.get("payout")
+                payout_str = f"{payout}" if payout is not None else "—"
+                price = a.get("price")
+                price_str = f"{price}" if price is not None else "—"
+                print(f"  {a['asset']:<20} {payout_str:<10} {price_str:<15}")
+
+            # إحصاءات
+            with_payout = sum(1 for a in assets if a.get("payout") is not None)
+            with_price = sum(1 for a in assets if a.get("price") is not None)
+            with_signals = sum(1 for a in assets if a.get("signals"))
+            print(f"\n{Colors.CYAN}Stats:{Colors.RESET}")
+            print(f"  Total assets:        {len(assets)}")
+            print(f"  With payout (sentiment): {with_payout}")
+            print(f"  With live price:     {with_price}")
+            print(f"  With signals:        {with_signals}")
+
+            # احفظ النتيجة في JSON
+            out_path = save_assets_info_to_json(result)
+            print(f"\n{Colors.GREEN}Saved assets info to:{Colors.RESET}")
+            print(f"  {Colors.CYAN}{out_path.absolute()}{Colors.RESET}")
+
+        # ===== 4) (اختياري) إذا مُرّر --asset عبر CLI، اجلب الشموع أيضاً =====
+        if args.get("asset") and args.get("days"):
+            asset = normalize_asset(args["asset"])
+            days = int(args["days"])
+            timeframe = int(args["timeframe"])
             print(f"\n{Colors.CYAN}{'-'*60}{Colors.RESET}")
-            print(f"{Colors.BOLD}  New fetch request{Colors.RESET}")
+            print(f"{Colors.BOLD}  Bonus: fetching candles for {asset}{Colors.RESET}")
             print(f"{Colors.CYAN}{'-'*60}{Colors.RESET}")
-
-            asset = args["asset"] if args["non_interactive"] else await prompt_asset()
-            if asset is None:
-                break
-            days = args["days"] if args["non_interactive"] else await prompt_days()
-            if days is None:
-                break
-            timeframe = args["timeframe"] if args["non_interactive"] else await prompt_timeframe()
-            if timeframe is None:
-                break
-
-            print(f"\n{Colors.CYAN}Summary:{Colors.RESET}")
-            print(f"  Asset:     {Colors.BOLD}{pretty_asset(asset, timeframe)}{Colors.RESET}")
-            print(f"  Days:      {days}")
-            print(f"  Timeframe: M{timeframe}")
-
-            fetch_count += 1
             candles = await fetch_candles_for_asset(
-                client, asset, days, timeframe,
-                idx=fetch_count, total=fetch_count,
-            )
-            if not candles:
-                print(f"{Colors.RED}No candles fetched.{Colors.RESET}")
-            else:
+                client, asset, days, timeframe, idx=1, total=1)
+            if candles:
                 filepath = save_candles_to_json(candles, asset, timeframe, days)
                 if filepath:
-                    print(f"{Colors.GREEN}OK Saved {len(candles)} candles to:{Colors.RESET}")
-                    print(f"  {Colors.CYAN}{filepath.absolute()}{Colors.RESET}")
-                else:
-                    print(f"{Colors.RED}Failed to save file.{Colors.RESET}")
+                    print(f"{Colors.GREEN}Saved {len(candles)} candles to: {filepath.absolute()}{Colors.RESET}")
+            else:
+                print(f"{Colors.YELLOW}No candles fetched for {asset}.{Colors.RESET}")
 
-            if args["non_interactive"]:
-                break
+        # ابقَ متصلاً قليلاً لاستقبال المزيد من تحديثات sentiment/quotes
+        print(f"\n{Colors.CYAN}Staying connected for 15s to receive more updates...{Colors.RESET}")
+        print(f"{Colors.DIM}(Press Ctrl+C to stop earlier){Colors.RESET}")
+        try:
+            await asyncio.sleep(15.0)
+        except KeyboardInterrupt:
+            pass
 
-            print(f"\n{Colors.YELLOW}Press Enter to fetch another asset, or type 'exit' to quit.{Colors.RESET}")
-            try:
-                choice = (await ainput()).strip().lower()
-                if choice in ('exit', 'quit', 'q'):
-                    break
-            except (EOFError, KeyboardInterrupt):
-                break
+        # إن وُجدت تحديثات إضافية، احفظ نسخة محدّثة
+        if client.api and (client.api.assets_sentiment or client.api.assets_quotes):
+            updated = await fetch_all_assets_info(client, wait_seconds=2.0)
+            if "error" not in updated:
+                out_path2 = save_assets_info_to_json(updated)
+                print(f"{Colors.GREEN}Updated assets info saved to: {out_path2.absolute()}{Colors.RESET}")
+
     finally:
         stop_keepalive.set()
         try:

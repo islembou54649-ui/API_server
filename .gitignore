@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+credentials.json
+binolla_data/
+binolla.log
+ws_messages_*.log
