@@ -2244,7 +2244,7 @@ async def keepalive_loop(client: "Binolla", stop_event: asyncio.Event) -> None:
     - نراقب `last_message_at` — إن لم تصل أي رسالة لأكثر من 60 ثانية، نُسجّل
       تحذيراً (الاتصال قد يكون معلّقاً).
     """
-    quotes_interval = 5.0   # ثانية بين كل طلب quotes/list
+    quotes_interval = 3.0   # ثانية بين كل طلب quotes/list (بث أكثر استجابة)
     assets_interval = 30.0  # ثانية بين كل طلب assets/list
     last_quotes_at = 0.0
     last_assets_at = 0.0
@@ -2963,20 +2963,334 @@ def parse_args() -> Dict[str, Any]:
 
 
 # ==============================================================================
-# SECTION 15: MAIN LOOP (continuous — no prompts, server stays alive)
+# SECTION 14.5: LIVE PRICE STREAM (event-driven, continuous)
+# ==============================================================================
+class LivePriceStream:
+    """يبث الأسعار اللحظية بشكل مستمر — يُطبع كل تحديث سعر فور وصوله.
+
+    آلية العمل:
+    - يُسجّل نفسه كمعالج (handler) لحدث `s_quotes/list` في BinollaAPI.
+    - كلما وصل تحديث أسعار من WebSocket، يُستدعى `handler()` فوراً.
+    - يطبّق throttling بسيط: max طبعة واحدة لكل أصل كل 0.3 ثانية (لتفادي الفيض).
+    - يدعم "watch mode": تخصيص أصل واحد لمتابعته حصرياً.
+
+    الاستخدام:
+        stream = LivePriceStream(api)
+        api.register_handler("s_quotes/list", stream.handler)
+        stream.start()
+    """
+
+    def __init__(self, api: "BinollaAPI", watch_asset: Optional[str] = None,
+                 min_interval: float = 0.3):
+        self.api = api
+        self.watch_asset = watch_asset    # None = كل الأصول
+        self.min_interval = min_interval  # ثانية بين طبعتين لنفس الأصل
+        self._last_print: Dict[str, float] = {}
+        self._enabled = True
+        self._print_count = 0
+
+    def start(self) -> None:
+        """يسجّل المعالج على s_quotes/list وs_asset/sentiment."""
+        if self.api:
+            self.api.register_handler("s_quotes/list", self._on_quotes)
+            self.api.register_handler("s_asset/sentiment", self._on_sentiment)
+
+    def stop(self) -> None:
+        """يوقف البث (المعالج يبقى مُسجّلاً لكنه لا يطبع)."""
+        self._enabled = False
+
+    def resume(self) -> None:
+        """يستأنف البث."""
+        self._enabled = True
+
+    def set_watch(self, asset: Optional[str]) -> None:
+        """None = بث كل الأصول، أو اسم أصل لمتابعته حصرياً."""
+        self.watch_asset = asset.strip().upper() if asset else None
+        self._last_print.clear()
+
+    def _on_quotes(self, *args) -> None:
+        """يُستدعى عند وصول s_quotes/list. يطبع الأسعار فوراً."""
+        if not self._enabled or not args:
+            return
+        payload = args[0]
+        items = payload if isinstance(payload, list) else [payload]
+        now = time.time()
+        for item in items:
+            if not isinstance(item, dict) or "asset" not in item:
+                continue
+            asset = item["asset"]
+            if self.watch_asset and asset.upper() != self.watch_asset:
+                continue
+            last = self._last_print.get(asset, 0)
+            if now - last < self.min_interval:
+                continue
+            self._last_print[asset] = now
+            self._print_quote(asset, item)
+
+    def _on_sentiment(self, *args) -> None:
+        """يُستدعى عند وصول s_asset/sentiment. يطبع نسبة الدفع فوراً."""
+        if not self._enabled or not args:
+            return
+        payload = args[0]
+        items = payload if isinstance(payload, list) else [payload]
+        for item in items:
+            if not isinstance(item, dict) or "asset" not in item:
+                continue
+            asset = item["asset"]
+            if self.watch_asset and asset.upper() != self.watch_asset:
+                continue
+            payout = item.get("sentiment",
+                              item.get("payout",
+                                       item.get("profit")))
+            ts = datetime.now().strftime("%H:%M:%S")
+            payout_str = f"{payout}%" if payout is not None else "—"
+            print(f"  {Colors.YELLOW}[{ts}] PAYOUT {Colors.RESET}"
+                  f"{asset:<20} {payout_str}")
+
+    def _print_quote(self, asset: str, item: Dict[str, Any]) -> None:
+        """يطبع سطر سعر لحظي واحد."""
+        price = None
+        for k in ("price", "value", "rate", "last", "bid", "ask"):
+            if k in item:
+                price = item[k]; break
+        sent = self.api.assets_sentiment.get(asset, {}) if self.api else {}
+        payout = sent.get("sentiment") if isinstance(sent, dict) else None
+        ts = datetime.now().strftime("%H:%M:%S")
+        payout_str = f"{payout}%" if payout is not None else "—"
+        price_str = f"{price}" if price is not None else "—"
+        self._print_count += 1
+        print(f"  {Colors.DIM}[{ts}]#{self._print_count}{Colors.RESET} "
+              f"{Colors.GREEN}{asset:<20}{Colors.RESET} "
+              f"payout={payout_str:<6} "
+              f"price={Colors.CYAN}{price_str}{Colors.RESET}")
+
+
+# ==============================================================================
+# SECTION 14.6: INTERACTIVE COMMAND PROCESSOR
+# ==============================================================================
+async def cmd_assets(client: "Binolla", live_stream: LivePriceStream) -> None:
+    """يجلب قائمة كل الأصول ويطبعها مع نسبة الدفع والسعر اللحظي بجوارها."""
+    if not client.api:
+        print(f"{Colors.RED}API not connected.{Colors.RESET}")
+        return
+    print(f"\n{Colors.CYAN}Fetching assets/list...{Colors.RESET}")
+    await client.api.event_registry.clear_event("s_assets/list")
+    client.api.fetch_assets()
+    payload = await client.api.event_registry.wait_event(
+        "s_assets/list", timeout=10.0)
+    if not payload:
+        payload = client.api.assets_list
+    if not payload:
+        print(f"{Colors.RED}No assets received.{Colors.RESET}")
+        return
+    client.api.assets_list = payload
+    asset_names = _extract_asset_names(payload)
+    if not asset_names:
+        print(f"{Colors.RED}Could not extract asset names from payload.{Colors.RESET}")
+        print(f"{Colors.DIM}Payload preview: {str(payload)[:300]}{Colors.RESET}")
+        return
+    print(f"\n{Colors.GREEN}Total assets: {len(asset_names)}{Colors.RESET}")
+    print(f"\n{Colors.BOLD}{'#':<4} {'Asset':<22} {'Payout%':<10} {'Price':<20}{Colors.RESET}")
+    print(f"    {'-'*22} {'-'*10} {'-'*20}")
+    for i, name in enumerate(asset_names, 1):
+        sent = client.api.assets_sentiment.get(name, {})
+        payout = sent.get("sentiment") if isinstance(sent, dict) else None
+        quote = client.api.assets_quotes.get(name)
+        price = None
+        if isinstance(quote, dict):
+            for k in ("price", "value", "rate", "last"):
+                if k in quote:
+                    price = quote[k]; break
+        elif isinstance(quote, (int, float)):
+            price = float(quote)
+        payout_str = f"{payout}%" if payout is not None else "—"
+        price_str = f"{price}" if price is not None else "—"
+        print(f"  {i:<4} {name:<22} {payout_str:<10} {price_str:<20}")
+    print(f"\n{Colors.DIM}Tip: type 'payout <asset>' to subscribe + watch payout for one asset.{Colors.RESET}")
+
+
+async def cmd_payout(client: "Binolla", live_stream: LivePriceStream,
+                      asset_arg: Optional[str] = None) -> None:
+    """يطبع نسبة الدفع الحالية لكل الأصول (أو لأصل محدد إن طُلب)."""
+    if not client.api:
+        return
+    if asset_arg:
+        # اشترك في sentiment لأصل محدد وانتظر التحديث
+        asset = asset_arg.strip()
+        print(f"{Colors.CYAN}Subscribing to sentiment for {asset}...{Colors.RESET}")
+        client.api.subscribe_asset_sentiment(asset)
+        await asyncio.sleep(1.5)
+        sent = client.api.assets_sentiment.get(asset, {})
+        payout = sent.get("sentiment") if isinstance(sent, dict) else None
+        if payout is not None:
+            print(f"  {asset:<22} payout={payout}%")
+        else:
+            print(f"  {asset}: no sentiment yet. Try again in a few seconds.")
+        return
+    # اطبع كل ما هو محفوظ
+    sentiments = client.api.assets_sentiment
+    if not sentiments:
+        print(f"{Colors.YELLOW}No payout data yet. Type 'assets' first to subscribe.{Colors.RESET}")
+        return
+    print(f"\n{Colors.BOLD}Payout % (sentiment) — {len(sentiments)} assets:{Colors.RESET}")
+    print(f"  {'Asset':<22} {'Payout%':<10}")
+    print(f"  {'-'*22} {'-'*10}")
+    for name in sorted(sentiments.keys()):
+        sent = sentiments[name]
+        payout = sent.get("sentiment") if isinstance(sent, dict) else None
+        payout_str = f"{payout}%" if payout is not None else "—"
+        print(f"  {name:<22} {payout_str:<10}")
+
+
+async def cmd_prices(client: "Binolla") -> None:
+    """يطبع آخر سعر لحظي محفوظ لكل الأصول."""
+    if not client.api:
+        return
+    quotes = client.api.assets_quotes
+    if not quotes:
+        print(f"{Colors.YELLOW}No quotes yet. Waiting for stream...{Colors.RESET}")
+        return
+    print(f"\n{Colors.BOLD}Live prices — {len(quotes)} assets:{Colors.RESET}")
+    print(f"  {'Asset':<22} {'Price':<20}")
+    print(f"  {'-'*22} {'-'*20}")
+    for name in sorted(quotes.keys()):
+        quote = quotes[name]
+        price = None
+        if isinstance(quote, dict):
+            for k in ("price", "value", "rate", "last"):
+                if k in quote:
+                    price = quote[k]; break
+        elif isinstance(quote, (int, float)):
+            price = float(quote)
+        price_str = f"{price}" if price is not None else "—"
+        print(f"  {name:<22} {price_str:<20}")
+
+
+async def cmd_candles(client: "Binolla", asset: str, days: int,
+                       timeframe: int) -> None:
+    """يجلب الشموع التاريخية ويحفظها في JSON."""
+    normalized = normalize_asset(asset)
+    if not normalized:
+        print(f"{Colors.RED}Invalid asset name: {asset}{Colors.RESET}")
+        return
+    if days <= 0:
+        print(f"{Colors.RED}Days must be positive.{Colors.RESET}")
+        return
+    if timeframe <= 0:
+        print(f"{Colors.RED}Timeframe must be positive.{Colors.RESET}")
+        return
+    print(f"\n{Colors.CYAN}Fetching candles for {normalized} "
+          f"({days}d, M{timeframe})...{Colors.RESET}")
+    candles = await fetch_candles_for_asset(
+        client, normalized, days, timeframe, idx=1, total=1)
+    if candles:
+        filepath = save_candles_to_json(candles, normalized, timeframe, days)
+        print(f"{Colors.GREEN}Saved {len(candles)} candles to: {filepath.absolute()}{Colors.RESET}")
+    else:
+        print(f"{Colors.RED}No candles fetched for {normalized}.{Colors.RESET}")
+
+
+async def cmd_watch(live_stream: LivePriceStream,
+                     asset_arg: Optional[str] = None) -> None:
+    """يضبط بث الأسعار على أصل محدد أو على كل الأصول."""
+    if asset_arg:
+        asset = asset_arg.strip()
+        live_stream.set_watch(asset)
+        print(f"{Colors.CYAN}Live stream now watching: {asset}{Colors.RESET}")
+    else:
+        live_stream.set_watch(None)
+        print(f"{Colors.CYAN}Live stream now watching: ALL assets{Colors.RESET}")
+
+
+def print_help() -> None:
+    """يطبع قائمة الأوامر المتاحة."""
+    print(f"\n{Colors.BOLD}Available commands:{Colors.RESET}")
+    print(f"  {Colors.CYAN}assets{Colors.RESET}                  Fetch + print all assets with payout% and price")
+    print(f"  {Colors.CYAN}payout [asset]{Colors.RESET}          Print payout% for all (or one) asset")
+    print(f"  {Colors.CYAN}prices{Colors.RESET}                   Print current cached live prices")
+    print(f"  {Colors.CYAN}candles <asset> <d> <tf>{Colors.RESET} Fetch candles (e.g. 'candles EURUSD_otc 7 1')")
+    print(f"  {Colors.CYAN}watch <asset>{Colors.RESET}           Focus live stream on one asset")
+    print(f"  {Colors.CYAN}watch all{Colors.RESET}               Stream all assets (default)")
+    print(f"  {Colors.CYAN}pause{Colors.RESET}                   Pause live price stream")
+    print(f"  {Colors.CYAN}resume{Colors.RESET}                  Resume live price stream")
+    print(f"  {Colors.CYAN}snapshot{Colors.RESET}                 Save JSON snapshot of all assets+payout+price")
+    print(f"  {Colors.CYAN}help{Colors.RESET}                    Show this help")
+    print(f"  {Colors.CYAN}quit{Colors.RESET}                    Exit")
+    print()
+
+
+async def process_command(cmd_line: str, client: "Binolla",
+                            args: Dict[str, Any],
+                            live_stream: LivePriceStream) -> bool:
+    """يُعالج سطر أمر واحد. يُعيد True لمتابعة الحلقة، False للخروج."""
+    parts = cmd_line.strip().split()
+    if not parts:
+        return True
+    cmd = parts[0].lower()
+    rest = parts[1:]
+
+    if cmd in ("quit", "exit", "q"):
+        return False
+    elif cmd == "help" or cmd == "?":
+        print_help()
+    elif cmd in ("assets", "list", "ls"):
+        await cmd_assets(client, live_stream)
+    elif cmd == "payout":
+        await cmd_payout(client, live_stream, rest[0] if rest else None)
+    elif cmd == "prices":
+        await cmd_prices(client)
+    elif cmd == "candles":
+        if len(rest) < 3:
+            print(f"{Colors.YELLOW}Usage: candles <asset> <days> <timeframe>{Colors.RESET}")
+            print(f"{Colors.DIM}Example: candles EURUSD_otc 7 1{Colors.RESET}")
+        else:
+            try:
+                asset = rest[0]
+                days = int(rest[1])
+                tf = int(rest[2])
+                await cmd_candles(client, asset, days, tf)
+            except ValueError:
+                print(f"{Colors.RED}days and timeframe must be integers.{Colors.RESET}")
+    elif cmd == "watch":
+        await cmd_watch(live_stream, rest[0] if rest else None)
+    elif cmd == "pause":
+        live_stream.stop()
+        print(f"{Colors.YELLOW}Live price stream paused.{Colors.RESET}")
+    elif cmd == "resume":
+        live_stream.resume()
+        print(f"{Colors.GREEN}Live price stream resumed.{Colors.RESET}")
+    elif cmd == "snapshot":
+        if client.api and (client.api.assets_sentiment or client.api.assets_quotes):
+            snapshot = await fetch_all_assets_info(client, wait_seconds=0.5)
+            if "error" not in snapshot:
+                out = save_assets_info_to_json(snapshot)
+                print(f"{Colors.GREEN}Snapshot saved to: {out.absolute()}{Colors.RESET}")
+            else:
+                print(f"{Colors.RED}Snapshot error: {snapshot['error']}{Colors.RESET}")
+        else:
+            print(f"{Colors.YELLOW}No data to snapshot yet.{Colors.RESET}")
+    else:
+        print(f"{Colors.RED}Unknown command: {cmd}{Colors.RESET}")
+        print(f"{Colors.DIM}Type 'help' for available commands.{Colors.RESET}")
+    return True
+
+
+# ==============================================================================
+# SECTION 15: MAIN LOOP (continuous stream + interactive commands)
 # ==============================================================================
 async def main_async():
-    """التدفق الرئيسي — حلقة مستمرة بدون أي أسئلة تفاعلية:
+    """التدفق الرئيسي — بث مستمر + أوامر تفاعلية:
 
     1) يحمّل credentials.json تلقائياً (الإيميل + كلمة السر)
     2) يسجّل الدخول عبر HTTP email/password
     3) يتصل مباشرة بحساب DEMO
     4) يشغّل 3 مهام خلفية متوازية:
-       a) keepalive_loop: يرسل quotes/list كل 5 ثوانٍ (يجلب الأسعار اللحظية + يبقي السيرفر نشطاً)
+       a) keepalive_loop: يرسل quotes/list كل 3 ثوانٍ (يجلب الأسعار + يبقي السيرفر نشطاً)
        b) jwt_refresh_loop: يحدّث JWT قبل انتهائه بـ 120 ثانية (لا حاجة لإعادة الاتصال)
        c) watchdog_reconnect_loop: يعيد الاتصال تلقائياً عند الانقطاع
-    5) يعرض الأسعار اللحظية كل 10 ثوانٍ ويحدّث ملف JSON كل 60 ثانية
-    6) لا ينتهي إلا بـ Ctrl+C
+    5) يشغّل LivePriceStream الذي يطبع الأسعار فور وصولها (event-driven)
+    6) يعرض قائمة أوامر تفاعلية: assets, payout, prices, candles, watch, etc.
+    7) لا ينتهي إلا بـ 'quit' أو Ctrl+C
     """
     args = parse_args()
     print_banner()
@@ -3022,7 +3336,7 @@ async def main_async():
     )
     print(f"{Colors.GREEN}Credentials saved to {CREDENTIALS_FILE.name}{Colors.RESET}\n")
 
-    # ===== 3) جلب أولي لكل الأصول + نسبة الدفع =====
+    # ===== 3) جلب أولي لكل الأصول + نسبة الدفع + اشتراك في sentiment عام =====
     print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
     print(f"{Colors.BOLD}  Initial fetch: all assets + payout% + live prices{Colors.RESET}")
     print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
@@ -3036,9 +3350,14 @@ async def main_async():
     keepalive_task = asyncio.create_task(keepalive_loop(client, stop_event))
     jwt_refresh_task = asyncio.create_task(jwt_refresh_loop(client, args, stop_event))
     watchdog_task = asyncio.create_task(watchdog_reconnect_loop(client, args, stop_event))
-    logmsg(f"{Colors.CYAN}Background tasks started: keepalive (5s), JWT refresh, watchdog.{Colors.RESET}")
+    logmsg(f"{Colors.CYAN}Background tasks: keepalive(3s), JWT refresh, watchdog.{Colors.RESET}")
 
-    # ===== 5) (اختياري) جلب الشموع إذا طُلب =====
+    # ===== 5) شغّل LivePriceStream (event-driven) =====
+    live_stream = LivePriceStream(client.api)
+    live_stream.start()
+    logmsg(f"{Colors.CYAN}Live price stream started (event-driven — prints on every quote update).{Colors.RESET}")
+
+    # ===== 6) (اختياري) جلب الشموع إذا طُلب عبر CLI =====
     if args.get("asset") and args.get("days"):
         try:
             asset = normalize_asset(args["asset"])
@@ -3053,79 +3372,31 @@ async def main_async():
         except Exception as e:
             logmsg(f"{Colors.YELLOW}Candle fetch error: {e}{Colors.RESET}")
 
-    # ===== 6) الحلقة الرئيسية: عرض الأسعار اللحظية كل 10 ثوانٍ =====
+    # ===== 7) قائمة الأوامر التفاعلية =====
     print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
-    print(f"{Colors.BOLD}  Live price stream (updates every 10s, JSON save every 60s){Colors.RESET}")
+    print(f"{Colors.BOLD}  Ready. Type a command (or 'help').{Colors.RESET}")
     print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
-    print(f"{Colors.DIM}Press Ctrl+C to stop.{Colors.RESET}\n")
-
-    display_interval = 10.0    # عرض كل 10 ثوان
-    save_interval = 60.0       # حفظ JSON كل 60 ثانية
-    last_display = 0.0
-    last_save = 0.0
-    tick_count = 0
+    print_help()
 
     try:
         while True:
-            now = time.time()
-
-            # === عرض الأسعار اللحظية ===
-            if now - last_display >= display_interval:
-                last_display = now
-                tick_count += 1
-                if client.api:
-                    quotes = client.api.assets_quotes
-                    sentiments = client.api.assets_sentiment
-                    n_quotes = len(quotes)
-                    n_sentiment = len(sentiments)
-                    idle = now - client.api.last_message_at
-                    connected = client.api.state.check_accepted_connection
-                    status_color = Colors.GREEN if connected else Colors.RED
-                    status_str = "CONNECTED" if connected else "DISCONNECTED"
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    print(f"\n{Colors.DIM}[{ts}]{Colors.RESET} "
-                          f"tick #{tick_count}  "
-                          f"{status_color}{status_str}{Colors.RESET}  "
-                          f"idle={idle:.0f}s  "
-                          f"prices={n_quotes}  payouts={n_sentiment}")
-                    # اعرض أول 5 أصول لديها سعر
-                    shown = 0
-                    for asset_name, quote in list(quotes.items())[:5]:
-                        price = None
-                        if isinstance(quote, dict):
-                            for k in ("price", "value", "rate", "last"):
-                                if k in quote:
-                                    price = quote[k]; break
-                        elif isinstance(quote, (int, float)):
-                            price = float(quote)
-                        sent = sentiments.get(asset_name, {})
-                        payout = sent.get("sentiment") if isinstance(sent, dict) else None
-                        payout_str = f"{payout}%" if payout is not None else "—"
-                        price_str = f"{price}" if price is not None else "—"
-                        print(f"  {asset_name:<20} payout={payout_str:<6} price={price_str}")
-                        shown += 1
-                    if shown == 0:
-                        print(f"  {Colors.DIM}(waiting for first quotes...){Colors.RESET}")
-
-            # === حفظ JSON دورياً ===
-            if now - last_save >= save_interval:
-                last_save = now
-                try:
-                    if client.api and (client.api.assets_sentiment or client.api.assets_quotes):
-                        snapshot = await fetch_all_assets_info(client, wait_seconds=0.5)
-                        if "error" not in snapshot:
-                            out_path = save_assets_info_to_json(snapshot)
-                            ts = datetime.now().strftime("%H:%M:%S")
-                            print(f"{Colors.DIM}[{ts}] Saved snapshot to {out_path.name}{Colors.RESET}")
-                except Exception as e:
-                    logger.debug("snapshot save error: %s", e)
-
-            await asyncio.sleep(1.0)
-
+            try:
+                cmd_line = await ainput(
+                    f"{Colors.YELLOW}binolla> {Colors.RESET}"
+                )
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not cmd_line.strip():
+                continue
+            should_continue = await process_command(
+                cmd_line, client, args, live_stream)
+            if not should_continue:
+                break
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
         stop_event.set()
+        live_stream.stop()
         for t in (keepalive_task, jwt_refresh_task, watchdog_task):
             try:
                 await asyncio.wait_for(t, timeout=2.0)
