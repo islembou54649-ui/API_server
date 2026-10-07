@@ -2694,10 +2694,28 @@ async def auto_login(args: Dict[str, Any]) -> Optional[str]:
         logmsg(f"Logging in as {email} via HTTP (qx__1.py-style)...")
         return await _http_login(args)
 
-    logmsg(f"{Colors.RED}No credentials available. "
-           f"Set BINOLLA_EMAIL+BINOLLA_PASSWORD or BINOLLA_TOKEN env vars, "
-           f"or run once interactively to populate credentials.json.{Colors.RESET}")
-    return None
+    # 4) لا اعتمادات على الإطلاق — اطلب email/password من المستخدم (مرة واحدة)
+    logmsg(f"{Colors.CYAN}No credentials found. First-time setup:{Colors.RESET}")
+    print(f"{Colors.DIM}  Enter your Binolla account email and password.{Colors.RESET}")
+    print(f"{Colors.DIM}  They will be saved to {CREDENTIALS_FILE.name} so you won't be asked again.{Colors.RESET}")
+    email_in, password_in = await prompt_email_password()
+    if not email_in or not password_in:
+        logmsg(f"{Colors.RED}Email and password are required. Exiting.{Colors.RESET}")
+        return None
+
+    # احفظهم فوراً في credentials.json (قبل محاولة الدخول لتفادي فقدانهم)
+    args["email"] = email_in
+    args["password"] = password_in
+    save_credentials(
+        token="",
+        email=email_in,
+        password=password_in,
+        is_demo=args.get("is_demo", True),
+        proxy=args.get("proxies", ""),
+    )
+    print(f"{Colors.GREEN}Credentials saved to {CREDENTIALS_FILE.name}{Colors.RESET}")
+    logmsg(f"Logging in as {email_in} via HTTP (qx__1.py-style)...")
+    return await _http_login(args)
 
 
 async def _http_login(args: Dict[str, Any]) -> Optional[str]:
