@@ -1544,12 +1544,24 @@ class Binolla:
         self.api: Optional[BinollaAPI] = None
 
     async def connect(self) -> Tuple[bool, str]:
-        self.api = BinollaAPI(
-            token=self.token,
-            is_demo=self.is_demo,
-            user_data_dir=self.user_data_dir,
-            proxies=self.proxies,
-        )
+        """يتصل بـ Binolla. يُعيد استخدام كائن API الموجود إن وُجد للحفاظ
+        على الحالة (watch_asset, current_asset, assets_quotes, إلخ) عبر إعادة
+        الاتصال."""
+        if self.api is None:
+            # أول اتصال: أنشئ كائن API جديد
+            self.api = BinollaAPI(
+                token=self.token,
+                is_demo=self.is_demo,
+                user_data_dir=self.user_data_dir,
+                proxies=self.proxies,
+            )
+        else:
+            # إعادة اتصال: حدّث التوكن فقط، احتفظ بكل الحالة (watch_asset, etc.)
+            self.api.token = self.token
+            self.api.state.SSID = self.token
+            # أعد تهيئة events للجولة الجديدة
+            self.api.state.init_events()
+            self.api.state.reset_events()
         self.api._async_loop = asyncio.get_running_loop()
         return await self.api.connect()
 
