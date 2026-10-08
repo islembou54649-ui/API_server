@@ -130,8 +130,21 @@ _request_counter = itertools.count(int(time.time() * 1000))
 # ==============================================================================
 # SECTION 1: LOGGING
 # ==============================================================================
+# علم عام: إن كان True، logmsg ستطبع سطراً جديداً قبل كل رسالة لتفادي
+# الكتابة فوق بث الأسعار اللحظي. يُضبط من LivePriceStream.
+_LIVE_STREAM_ACTIVE = False
+
+
+def set_live_stream_active(active: bool) -> None:
+    global _LIVE_STREAM_ACTIVE
+    _LIVE_STREAM_ACTIVE = active
+
+
 def logmsg(msg: str) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
+    # إن كان البث اللحظي نشطاً، اطبع على سطر جديد أولاً لتفادي الكتابة فوق السعر
+    if _LIVE_STREAM_ACTIVE:
+        sys.stdout.write("\n")
     print(f"  \033[2m[{ts}]\033[0m {msg}")
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -1143,6 +1156,9 @@ class BinollaAPI:
         # quotes = السعر اللحظي لكل أصل
         self.assets_quotes: Dict[str, Any] = {}
 
+        # الأصل المُتابَع حالياً (للاستعادة بعد reconnect)
+        self.watch_asset: Optional[str] = None
+
         # Event Registry
         self.event_registry = EventRegistry()
         self.event_data: Dict[str, Any] = {}
@@ -1309,6 +1325,38 @@ class BinollaAPI:
         payload = [{"asset": asset, "period": period}]
         data = '42["asset/list/change",' + json.dumps(payload, separators=(",", ":")) + ']'
         self.send_websocket_request(data)
+
+    def restore_subscriptions(self) -> None:
+        """يُعيد إرسال كل الاشتراكات بعد إعادة اتصال WebSocket.
+
+        يُستدعى تلقائياً بعد نجاح الـ watchdog reconnect. يعيد:
+        1) asset/list/change للأصل المُتابَع (إن وُجد) لتفعيل تدفق quotes
+        2) asset/sentiment/subscribe لجلب نسبة الدفع
+        3) s_asset/sentiment/subscribe للاشتراك العام
+        4) quotes/list لطلب الأسعار فوراً
+        5) assets/list لتحديث قائمة الأصول
+        """
+        try:
+            # إن وُجد أصل مُتابَع، أعد تفعيل تدفق quotes له
+            asset = self.watch_asset or self.current_asset
+            if asset:
+                period = self.current_period or 60
+                self.change_asset(asset, period)
+                time.sleep(0.05)
+                # اشترك في sentiment خاص بالأصل
+                self.subscribe_asset_sentiment(asset)
+                time.sleep(0.05)
+            # اشترك في sentiment العام
+            self.subscribe_global_sentiment()
+            time.sleep(0.05)
+            # اطلب quotes و assets فوراً
+            self.subscribe_quotes()
+            time.sleep(0.05)
+            self.fetch_assets()
+            logger.info("Subscriptions restored after reconnect (asset=%s).",
+                        asset or "none")
+        except Exception as e:
+            logger.error("Error restoring subscriptions: %s", e)
 
     def subscribe_quotes(self) -> None:
         """يشترك في بث الاقتباسات اللحظية (s_quotes/list)."""
@@ -2246,9 +2294,11 @@ async def keepalive_loop(client: "Binolla", stop_event: asyncio.Event) -> None:
     """
     quotes_interval = 3.0   # ثانية بين كل طلب quotes/list (بث أكثر استجابة)
     assets_interval = 30.0  # ثانية بين كل طلب assets/list
+    ws_ping_interval = 20.0    # Engine.IO PING كل 20 ثانية
+    stale_warning_threshold = 30.0   # 30 ثانية بدون رسائل = تحذير مبكر
     last_quotes_at = 0.0
     last_assets_at = 0.0
-    start = time.time()
+    last_ws_ping_at = 0.0
 
     while not stop_event.is_set():
         try:
@@ -2264,10 +2314,21 @@ async def keepalive_loop(client: "Binolla", stop_event: asyncio.Event) -> None:
 
         # 1) تحقق من صحة الاتصال
         if not client.api.state.check_accepted_connection:
-            logger.warning("Connection lost (auth flag cleared). Watchdog will reconnect.")
+            # لا نرسل شيئاً — الـ watchdog سيتولى إعادة الاتصال
             continue
 
-        # 2) أرسل quotes/list كل quotes_interval ثانية (يجلب الأسعار اللحظية + يبقي السيرفر نشطاً)
+        # 2) أرسل Engine.IO PING كل 20 ثانية (يمنع انقطاع TCP/TLS)
+        if now - last_ws_ping_at >= ws_ping_interval:
+            try:
+                if (client.api.websocket_client
+                        and client.api.websocket_client.wss):
+                    client.api.websocket_client.wss.send("2")  # Engine.IO PING
+                    last_ws_ping_at = now
+                    logger.debug("Sent Engine.IO PING (2)")
+            except Exception as e:
+                logger.debug("keepalive PING err: %s", e)
+
+        # 3) أرسل quotes/list كل 3 ثوانٍ (يجلب الأسعار اللحظية + يبقي السيرفر نشطاً)
         if now - last_quotes_at >= quotes_interval:
             try:
                 client.api.subscribe_quotes()
@@ -2275,7 +2336,7 @@ async def keepalive_loop(client: "Binolla", stop_event: asyncio.Event) -> None:
             except Exception as e:
                 logger.debug("keepalive quotes/list err: %s", e)
 
-        # 3) أرسل assets/list كل assets_interval ثانية (يجلب قائمة الأصول المُحدّثة)
+        # 4) أرسل assets/list كل 30 ثانية (يجلب قائمة الأصول المُحدّثة)
         if now - last_assets_at >= assets_interval:
             try:
                 client.api.fetch_assets()
@@ -2283,10 +2344,11 @@ async def keepalive_loop(client: "Binolla", stop_event: asyncio.Event) -> None:
             except Exception as e:
                 logger.debug("keepalive assets/list err: %s", e)
 
-        # 4) فحص صحي فقط
+        # 5) فحص صحي مبكر — إن لم تصل رسائل منذ 30 ثانية، اضغط على الـ watchdog
         idle = now - client.api.last_message_at
-        if idle > 60.0:
-            logger.warning("No WebSocket messages in %.0fs — connection may be stale.", idle)
+        if idle > stale_warning_threshold:
+            logger.warning("No WebSocket messages in %.0fs — forcing watchdog reconnect.", idle)
+            client.api.state.check_accepted_connection = False
 
 
 async def connect_binolla(token: str, is_demo: bool = True,
@@ -2395,13 +2457,18 @@ async def watchdog_reconnect_loop(client: "Binolla", args: Dict[str, Any],
     """يراقب الاتصال ويُعيد الاتصال تلقائياً عند انقطاعه.
 
     آلية العمل:
-    - كل 10 ثوانٍ، يفحص `state.check_accepted_connection` و`last_message_at`.
-    - إن كان الاتصال ميتاً (لا رسائل منذ 90+ ثانية، أو رُفضت المصادقة)،
+    - كل 5 ثوانٍ (بدل 10)، يفحص `state.check_accepted_connection` و`last_message_at`.
+    - إن كان الاتصال ميتاً (لا رسائل منذ 30+ ثانية، أو رُفضت المصادقة)،
       يُعيد بناء `BinollaWebsocketClient` بـ JWT محدّث ويُعيد الاتصال.
+    - بعد نجاح إعادة الاتصال، يستدعي `restore_subscriptions()` لإعادة كل
+      الاشتراكات (asset/list/change + sentiment + quotes + assets) للأصل
+      المُتابَع.
     - لا يطلب أي إدخال من المستخدم.
+    - يحاول إعادة الاتصال حتى 5 مرات بفواصل متزايدة (1s, 2s, 4s, 8s, 16s).
     """
-    check_interval = 10.0
-    stale_threshold = 90.0    # 90 ثانية بدون رسائل = اتصال ميت
+    check_interval = 5.0      # فحص كل 5 ثوانٍ (أسرع من 10)
+    stale_threshold = 30.0    # 30 ثانية بدون رسائل = اتصال ميت (أسرع من 90)
+    max_reconnect_attempts = 5
 
     while not stop_event.is_set():
         try:
@@ -2436,7 +2503,7 @@ async def watchdog_reconnect_loop(client: "Binolla", args: Dict[str, Any],
             pass
         await asyncio.sleep(1.0)
 
-        # احصل على أحدث توكن
+        # احصل على أحدث توكن (جدّده إن انتهى)
         current_token = client.api.token or client.token or ""
         if not current_token or is_token_expired(current_token):
             logmsg(f"{Colors.CYAN}Watchdog: refreshing JWT before reconnect...{Colors.RESET}")
@@ -2449,23 +2516,36 @@ async def watchdog_reconnect_loop(client: "Binolla", args: Dict[str, Any],
             client.api.state.SSID = new_token
             client.token = new_token
 
-        # أعد بناء الاتصال
-        logmsg(f"{Colors.CYAN}Watchdog: reconnecting WebSocket...{Colors.RESET}")
-        try:
-            ok, reason = await asyncio.wait_for(client.connect(), timeout=30)
-            if ok:
-                logmsg(f"{Colors.GREEN}Watchdog: reconnected successfully.{Colors.RESET}")
-                # أعد إرسال اشتراكات sentiment العامة بعد إعادة الاتصال
-                try:
-                    client.api.subscribe_global_sentiment()
-                except Exception:
-                    pass
-            else:
-                logmsg(f"{Colors.RED}Watchdog: reconnect failed: {reason}{Colors.RESET}")
-        except asyncio.TimeoutError:
-            logmsg(f"{Colors.RED}Watchdog: reconnect timed out.{Colors.RESET}")
-        except Exception as e:
-            logmsg(f"{Colors.RED}Watchdog: reconnect error: {e}{Colors.RESET}")
+        # أعد بناء الاتصال (حتى 5 محاولات)
+        reconnected = False
+        for attempt in range(1, max_reconnect_attempts + 1):
+            logmsg(f"{Colors.CYAN}Watchdog: reconnect attempt {attempt}/{max_reconnect_attempts}...{Colors.RESET}")
+            try:
+                ok, reason = await asyncio.wait_for(client.connect(), timeout=30)
+                if ok:
+                    logmsg(f"{Colors.GREEN}Watchdog: reconnected successfully (attempt {attempt}).{Colors.RESET}")
+                    # أعد الاشتراكات بعد نجاح إعادة الاتصال
+                    try:
+                        client.api.restore_subscriptions()
+                        logmsg(f"{Colors.GREEN}Subscriptions restored after reconnect.{Colors.RESET}")
+                    except Exception as e:
+                        logger.error("Error restoring subscriptions: %s", e)
+                    reconnected = True
+                    break
+                else:
+                    logmsg(f"{Colors.RED}Watchdog: reconnect failed: {reason}{Colors.RESET}")
+            except asyncio.TimeoutError:
+                logmsg(f"{Colors.RED}Watchdog: reconnect timed out (attempt {attempt}).{Colors.RESET}")
+            except Exception as e:
+                logmsg(f"{Colors.RED}Watchdog: reconnect error (attempt {attempt}): {e}{Colors.RESET}")
+            # فاصل متزايد: 1s, 2s, 4s, 8s, 16s
+            if attempt < max_reconnect_attempts:
+                delay = 2 ** (attempt - 1)
+                logmsg(f"Retrying in {delay}s...")
+                await asyncio.sleep(delay)
+        if not reconnected:
+            logmsg(f"{Colors.RED}Watchdog: all {max_reconnect_attempts} reconnect attempts failed.{Colors.RESET}")
+            logmsg(f"Will retry in {check_interval:.0f}s...")
 
 
 async def fetch_candles_for_asset(client: Binolla, asset: str, days: int,
@@ -3120,15 +3200,30 @@ class LivePriceStream:
     def stop(self) -> None:
         """يوقف البث (المعالج يبقى مُسجّلاً لكنه لا يطبع)."""
         self._enabled = False
+        # أعطّل flag لكي logmsg يطبع بشكل طبيعي
+        set_live_stream_active(False)
+        # اطبع سطراً جديداً ليفصل البث عن الرسائل التالية
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
     def resume(self) -> None:
         """يستأنف البث."""
         self._enabled = True
+        set_live_stream_active(True)
 
     def set_watch(self, asset: Optional[str]) -> None:
-        """None = بث كل الأصول، أو اسم أصل لمتابعته حصرياً."""
+        """None = بث كل الأصول، أو اسم أصل لمتابعته حصرياً.
+
+        يُخزّن أيضاً في api.watch_asset ليُستعاد بعد إعادة اتصال WebSocket.
+        """
         self.watch_asset = asset.strip().upper() if asset else None
         self._last_print.clear()
+        # خزّن في API للاستعادة بعد reconnect
+        if self.api:
+            self.api.watch_asset = self.watch_asset
+            # حدّث current_asset أيضاً (يُستخدم في fallback لاسم الأصل)
+            if self.watch_asset:
+                self.api.current_asset = self.watch_asset
 
     def set_debug(self, enabled: bool) -> None:
         """يُفعّل/يُعطّل وضع debug (يطبع اسم كل حدث يصل)."""
@@ -3382,8 +3477,10 @@ class LivePriceStream:
         payout_str = f"{payout}%" if payout is not None else "—"
         price_str = f"{price}" if price is not None else "waiting..."
         self._print_count += 1
+        # فعّل flag لكي logmsg لا تكتب فوق السعر
+        set_live_stream_active(True)
         # استخدم \r للكتابة فوق نفس السطر (inline update)
-        # استخدم \033[K لمسح باقي السطر
+        # \033[K يمسح باقي السطر لتفادي اختلاط النصوص
         line = (f"\r\033[K  {Colors.DIM}[{ts}]#{self._print_count}{Colors.RESET} "
                 f"{Colors.GREEN}{asset:<20}{Colors.RESET} "
                 f"payout={payout_str:<6} "
