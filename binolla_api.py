@@ -2282,22 +2282,22 @@ def save_candles_to_json(candles: List[Dict], asset: str,
 async def keepalive_loop(client: "Binolla", stop_event: asyncio.Event) -> None:
     """حلقة نشطة للحفاظ على اتصال WebSocket ومنع "نوم" السيرفر.
 
-    في EIO=4 (Socket.IO v4)، الخادم يُرسل "2" (PING) كل ~25 ثانية، والعميل
-    يردّ بـ "3" (PONG) داخل `BinollaWebsocketClient.on_message`. هذا يكفي للحفاظ
-    على الاتصال، لكن لإبقاء تدفق الأسعار اللحظية مستمراً:
+    بروتوكول Engine.IO v4 (Socket.IO v4):
+    - الخادم يُرسل "2" (PING) كل ~25 ثانية.
+    - العميل يردّ بـ "3" (PONG) تلقائياً داخل `BinollaWebsocketClient.on_message`.
+    - العميل **لا يجب** أن يُرسل "2" أبداً — ذلك انتهاك للبروتوكول ويُسبب
+      إغلاق الاتصال فوراً من الخادم.
 
+    آلية عمل هذه الحلقة (بدون إرسال PING):
     - كل 5 ثوانٍ: نُرسل `quotes/list` لطلب الأسعار اللحظية (يُجبر السيرفر على
-      إرسال تحديثات s_quotes/list بدلاً من الانتظار السلبي).
+      إرسال تحديثات s_quotes/list + يُبقي قناة WebSocket نشطة).
     - كل 30 ثانية: نُرسل `assets/list` لطلب قائمة الأصول المُحدّثة.
-    - نراقب `last_message_at` — إن لم تصل أي رسالة لأكثر من 60 ثانية، نُسجّل
-      تحذيراً (الاتصال قد يكون معلّقاً).
+    - نراقب `last_message_at` للتحذير فقط (بدون إعادة اتصال قسرية).
     """
-    quotes_interval = 3.0   # ثانية بين كل طلب quotes/list
+    quotes_interval = 5.0   # ثانية بين كل طلب quotes/list
     assets_interval = 30.0  # ثانية بين كل طلب assets/list
-    ws_ping_interval = 20.0    # Engine.IO PING كل 20 ثانية
     last_quotes_at = 0.0
     last_assets_at = 0.0
-    last_ws_ping_at = 0.0
 
     while not stop_event.is_set():
         try:
@@ -2316,18 +2316,9 @@ async def keepalive_loop(client: "Binolla", stop_event: asyncio.Event) -> None:
             # لا نرسل شيئاً — الـ watchdog سيتولى إعادة الاتصال
             continue
 
-        # 2) أرسل Engine.IO PING كل 20 ثانية (يمنع انقطاع TCP/TLS)
-        if now - last_ws_ping_at >= ws_ping_interval:
-            try:
-                if (client.api.websocket_client
-                        and client.api.websocket_client.wss):
-                    client.api.websocket_client.wss.send("2")  # Engine.IO PING
-                    last_ws_ping_at = now
-                    logger.debug("Sent Engine.IO PING (2)")
-            except Exception as e:
-                logger.debug("keepalive PING err: %s", e)
-
-        # 3) أرسل quotes/list كل 3 ثوانٍ (يجلب الأسعار اللحظية + يبقي السيرفر نشطاً)
+        # 2) أرسل quotes/list كل 5 ثوانٍ (يجلب الأسعار اللحظية + يُبقي السيرفر نشطاً)
+        #    ملاحظة: لا نُرسل Engine.IO PING "2" — ذلك دور الخادم في EIO=4.
+        #    إرسال "2" من العميل يُعتبر انتهاك للبروتوكول ويُغلق الاتصال.
         if now - last_quotes_at >= quotes_interval:
             try:
                 client.api.subscribe_quotes()
@@ -2335,7 +2326,7 @@ async def keepalive_loop(client: "Binolla", stop_event: asyncio.Event) -> None:
             except Exception as e:
                 logger.debug("keepalive quotes/list err: %s", e)
 
-        # 4) أرسل assets/list كل 30 ثانية (يجلب قائمة الأصول المُحدّثة)
+        # 3) أرسل assets/list كل 30 ثانية (يجلب قائمة الأصول المُحدّثة)
         if now - last_assets_at >= assets_interval:
             try:
                 client.api.fetch_assets()
@@ -2343,8 +2334,7 @@ async def keepalive_loop(client: "Binolla", stop_event: asyncio.Event) -> None:
             except Exception as e:
                 logger.debug("keepalive assets/list err: %s", e)
 
-        # 5) فحص صحي — تحذير فقط، لا نُجبر إعادة الاتصال
-        #    الـ watchdog يعتمد على حالة الـ WebSocket الفعلية (on_close/on_error)
+        # 4) فحص صحي — تحذير فقط، لا نُجبر إعادة الاتصال
         idle = now - client.api.last_message_at
         if idle > 90.0:
             logger.warning("No WebSocket messages in %.0fs (idle). "
