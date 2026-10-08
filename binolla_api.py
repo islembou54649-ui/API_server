@@ -2968,6 +2968,35 @@ def _normalize_asset_for_quote(name: str) -> str:
     return s
 
 
+def _format_asset_status(rec: Dict[str, Any]) -> Tuple[str, str]:
+    """يُعيد (status_text, color) لحالة الأصل (مفتوح/مغلق).
+
+    يعتمد على:
+      - rec['is_tradable'] (True/False/None) من tuple position 14
+      - rec['expire_at'] (Unix timestamp) من tuple position 13
+        → إن انتهت مدة الصلاحية، يُعتبر مغلقاً
+
+    يُعيد:
+      - ("OPEN", Colors.GREEN)   ← مفتوح للتداول
+      - ("CLOSED", Colors.RED)    ← مغلق للتداول
+      - ("?", Colors.DIM)         ← غير معروف
+    """
+    is_tradable = rec.get("is_tradable")
+    expire_at = rec.get("expire_at")
+
+    # إن وُجد expire_at وانتهى، اعتبره مغلقاً
+    if isinstance(expire_at, (int, float)) and expire_at > 0:
+        if time.time() > expire_at:
+            return ("CLOSED", Colors.RED)
+
+    if is_tradable is True:
+        return ("OPEN", Colors.GREEN)
+    if is_tradable is False:
+        return ("CLOSED", Colors.RED)
+    # غير معروف
+    return ("?", Colors.DIM)
+
+
 def save_assets_info_to_json(payload: Dict[str, Any],
                               out_path: Optional[Path] = None) -> Path:
     """يحفظ بيانات الأصول (الاسم، نسبة الدفع، السعر اللحظي) في ملف JSON."""
@@ -3476,6 +3505,14 @@ class LivePriceStream:
         ts = datetime.now().strftime("%H:%M:%S")
         payout_str = f"{payout}%" if payout is not None else "—"
         price_str = f"{price}" if price is not None else "waiting..."
+        # جلب حالة الأصل (مفتوح/مغلق) من قائمة الأصول المُخزّنة
+        status_str = ""
+        if self.api and self.api.assets_list:
+            records = _extract_asset_records(self.api.assets_list)
+            rec = next((r for r in records if r.get("asset") == asset), None)
+            if rec:
+                status_text, status_color = _format_asset_status(rec)
+                status_str = f"{status_color}{status_text:<7}{Colors.RESET} "
         self._print_count += 1
         # فعّل flag لكي logmsg لا تكتب فوق السعر
         set_live_stream_active(True)
@@ -3483,6 +3520,7 @@ class LivePriceStream:
         # \033[K يمسح باقي السطر لتفادي اختلاط النصوص
         line = (f"\r\033[K  {Colors.DIM}[{ts}]#{self._print_count}{Colors.RESET} "
                 f"{Colors.GREEN}{asset:<20}{Colors.RESET} "
+                f"{status_str}"
                 f"payout={payout_str:<6} "
                 f"price={Colors.CYAN}{price_str}{Colors.RESET}")
         sys.stdout.write(line)
@@ -3543,13 +3581,23 @@ async def cmd_assets(client: "Binolla", live_stream: LivePriceStream) -> None:
     print(f"\n{Colors.BOLD}By type:{Colors.RESET} " +
           "  ".join(f"{t}={len(recs)}" for t, recs in sorted(by_type.items())))
 
+    # إحصاءات الحالة (مفتوح/مغلق)
+    open_count = sum(1 for r in records if _format_asset_status(r)[0] == "OPEN")
+    closed_count = sum(1 for r in records if _format_asset_status(r)[0] == "CLOSED")
+    print(f"{Colors.BOLD}By status:{Colors.RESET} " +
+          f"{Colors.GREEN}OPEN={open_count}{Colors.RESET}  " +
+          f"{Colors.RED}CLOSED={closed_count}{Colors.RESET}")
+
     print(f"\n{Colors.BOLD}{'#':<4} {'Asset':<22} {'Name':<24} {'Type':<10} "
-          f"{'Payout%':<10} {'Price':<15}{Colors.RESET}")
-    print(f"    {'-'*22} {'-'*24} {'-'*10} {'-'*10} {'-'*15}")
+          f"{'Status':<8} {'Payout%':<10} {'Price':<15}{Colors.RESET}")
+    print(f"    {'-'*22} {'-'*24} {'-'*10} {'-'*8} {'-'*10} {'-'*15}")
     for i, rec in enumerate(records, 1):
         name = rec.get("asset", "")
         display = rec.get("name", name)[:22]
         atype = rec.get("type", "")[:10]
+        # حالة الأصل (مفتوح/مغلق)
+        status_text, status_color = _format_asset_status(rec)
+        status_str = f"{status_color}{status_text:<8}{Colors.RESET}"
         # payout من السجل نفسه (من tuple) أو من sentiment المُلتقَط
         payout = rec.get("payout")
         if payout is None:
@@ -3572,7 +3620,7 @@ async def cmd_assets(client: "Binolla", live_stream: LivePriceStream) -> None:
                 price = rec["ask"]
         payout_str = f"{payout}%" if payout is not None else "—"
         price_str = f"{price}" if price is not None else "—"
-        print(f"  {i:<4} {name:<22} {display:<24} {atype:<10} {payout_str:<10} {price_str:<15}")
+        print(f"  {i:<4} {name:<22} {display:<24} {atype:<10} {status_str} {payout_str:<10} {price_str:<15}")
 
     # اعرض الإحصاءات النهائية
     with_payout = sum(1 for r in records if r.get("payout") is not None)
@@ -3580,8 +3628,11 @@ async def cmd_assets(client: "Binolla", live_stream: LivePriceStream) -> None:
                                             or r.get("ask") is not None
                                             or r["asset"] in client.api.assets_quotes))
     print(f"\n{Colors.CYAN}Summary:{Colors.RESET} "
-          f"with_payout={with_payout}/{len(records)}  "
-          f"with_price={with_price}/{len(records)}")
+          f"total={len(records)}  "
+          f"{Colors.GREEN}open={open_count}{Colors.RESET}  "
+          f"{Colors.RED}closed={closed_count}{Colors.RESET}  "
+          f"with_payout={with_payout}  "
+          f"with_price={with_price}")
     print(f"{Colors.DIM}Tip: type 'watch <asset>' to focus live stream on one asset.{Colors.RESET}")
     print(f"{Colors.DIM}     type 'candles EURUSD_otc 7 1' to fetch historical candles.{Colors.RESET}")
 
@@ -3713,6 +3764,9 @@ async def cmd_prices_live(client: "Binolla", live_stream: LivePriceStream,
         print(f"  Asset:       {asset}")
         print(f"  Name:        {asset_info.get('name', '—')}")
         print(f"  Type:        {asset_info.get('type', '—')}")
+        # حالة الأصل (مفتوح/مغلق)
+        status_text, status_color = _format_asset_status(asset_info)
+        print(f"  Status:      {status_color}{status_text}{Colors.RESET}")
         payout_cached = asset_info.get("payout")
         if payout_cached is not None:
             print(f"  Payout:      {payout_cached}%")
@@ -3722,6 +3776,10 @@ async def cmd_prices_live(client: "Binolla", live_stream: LivePriceStream,
             print(f"  Last bid:    {bid}")
         if ask is not None:
             print(f"  Last ask:    {ask}")
+        # تحذير إن كان مغلقاً
+        if status_text == "CLOSED":
+            print(f"\n  {Colors.RED}WARNING: This asset is currently CLOSED for trading.{Colors.RESET}")
+            print(f"  {Colors.DIM}Live prices may still stream, but you cannot place trades.{Colors.RESET}")
     else:
         print(f"  Asset: {asset} (not found in assets list — will try anyway)")
 
