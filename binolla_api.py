@@ -3094,12 +3094,14 @@ class LivePriceStream:
         self._last_print: Dict[str, float] = {}
         self._enabled = True
         self._print_count = 0
+        self.debug = False   # وضع debug: يطبع اسم كل حدث يصل
 
     def start(self) -> None:
-        """يسجّل المعالج على s_quotes/list وs_asset/sentiment."""
+        """يسجّل المعالج على s_quotes/list وs_asset/sentiment وs_history/last."""
         if self.api:
             self.api.register_handler("s_quotes/list", self._on_quotes)
             self.api.register_handler("s_asset/sentiment", self._on_sentiment)
+            self.api.register_handler("s_history/last", self._on_history_last)
 
     def stop(self) -> None:
         """يوقف البث (المعالج يبقى مُسجّلاً لكنه لا يطبع)."""
@@ -3114,30 +3116,187 @@ class LivePriceStream:
         self.watch_asset = asset.strip().upper() if asset else None
         self._last_print.clear()
 
+    def set_debug(self, enabled: bool) -> None:
+        """يُفعّل/يُعطّل وضع debug (يطبع اسم كل حدث يصل)."""
+        self.debug = enabled
+
     def _on_quotes(self, *args) -> None:
         """يُستدعى عند وصول s_quotes/list. يطبع الأسعار فوراً."""
-        if not self._enabled or not args:
+        if not self._enabled and not self.debug:
+            return
+        if not args:
             return
         payload = args[0]
+        if self.debug:
+            ts = datetime.now().strftime("%H:%M:%S")
+            preview = str(payload)[:200]
+            print(f"  {Colors.DIM}[{ts}] DEBUG s_quotes/list: {preview}{Colors.RESET}")
+        if not self._enabled:
+            return
+        # قد تكون القائمة من dicts أو tuples أو قيمة بسيطة
         items = payload if isinstance(payload, list) else [payload]
         now = time.time()
         for item in items:
-            if not isinstance(item, dict) or "asset" not in item:
+            asset, price = self._extract_asset_and_price(item)
+            if not asset:
                 continue
-            asset = item["asset"]
             if self.watch_asset and asset.upper() != self.watch_asset:
                 continue
             last = self._last_print.get(asset, 0)
             if now - last < self.min_interval:
                 continue
             self._last_print[asset] = now
-            self._print_quote(asset, item)
+            self._print_quote(asset, price)
+
+    def _on_history_last(self, *args) -> None:
+        """يُستدعى عند وصول s_history/last. يحتوي على أحدث ticks للأصل الحالي.
+
+        بنية payload المحتملة:
+          - {"asset":"XTIUSD_otc", "history":[[ts, price, dir], ...]}
+          - {"asset":"XTIUSD_otc", "candles":[[time, o, c, h, l, v], ...]}
+          - [[ts, price, dir], ...]  (قائمة ticks مباشرة)
+        آخر tick/شمعة يحتوي على السعر اللحظي.
+        """
+        if not self._enabled and not self.debug:
+            return
+        if not args:
+            return
+        payload = args[0]
+        if self.debug:
+            ts = datetime.now().strftime("%H:%M:%S")
+            preview = str(payload)[:200]
+            print(f"  {Colors.DIM}[{ts}] DEBUG s_history/last: {preview}{Colors.RESET}")
+        if not self._enabled:
+            return
+
+        # استخرج اسم الأصل والسعر
+        asset_name = None
+        if isinstance(payload, dict):
+            asset_name = payload.get("asset") or payload.get("symbol")
+        # fallback: استخدم الأصل الحالي من API
+        if not asset_name and self.api:
+            asset_name = self.api.current_asset
+        if not asset_name and self.watch_asset:
+            asset_name = self.watch_asset
+        if not asset_name:
+            return
+
+        if self.watch_asset and asset_name.upper() != self.watch_asset:
+            return
+
+        price = self._extract_latest_price(payload)
+        if price is None:
+            return
+
+        now = time.time()
+        last = self._last_print.get(asset_name, 0)
+        if now - last < self.min_interval:
+            # حتى مع throttling، حدّث المخزن المؤقت
+            if self.api:
+                self.api.assets_quotes[asset_name] = {"price": price}
+            return
+        self._last_print[asset_name] = now
+        # حدّث المخزن المؤقت
+        if self.api:
+            self.api.assets_quotes[asset_name] = {"price": price}
+        self._print_quote(asset_name, price)
+
+    def _extract_asset_and_price(self, item: Any) -> Tuple[Optional[str], Optional[float]]:
+        """يستخرج اسم الأصل والسعر من عنصر quote بأي صيغة محتملة.
+
+        الصيغ المدعومة:
+          - {"asset":"EURUSD_otc", "price":1.0823, ...}
+          - {"asset":"EURUSD_otc", "bid":1.0823, "ask":1.0825, ...}
+          - ("EURUSD_otc", 1.0823)  (tuple)
+          - ["EURUSD_otc", 1.0823]  (list)
+          - 1.0823  (قيمة بسيطة — يستخدم اسم الأصل الحالي)
+        """
+        if isinstance(item, dict):
+            asset = item.get("asset") or item.get("name") or item.get("symbol")
+            price = None
+            for k in ("price", "value", "rate", "last", "bid", "ask", "close"):
+                if k in item:
+                    try:
+                        price = float(item[k])
+                        break
+                    except (ValueError, TypeError):
+                        continue
+            return asset, price
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            asset = item[0] if isinstance(item[0], str) else None
+            try:
+                price = float(item[1])
+            except (ValueError, TypeError):
+                price = None
+            return asset, price
+        # قيمة بسيطة — استخدم الأصل الحالي
+        if isinstance(item, (int, float)):
+            asset = self.watch_asset or (self.api.current_asset if self.api else None)
+            try:
+                return asset, float(item)
+            except (ValueError, TypeError):
+                return asset, None
+        return None, None
+
+    def _extract_latest_price(self, payload: Any) -> Optional[float]:
+        """يستخرج آخر سعر من payload الـ history/last.
+
+        يحاول عدة صيغ:
+          - {"history":[[ts, price, dir], ...]}  ← tick format
+          - {"candles":[[time, o, c, h, l, v], ...]}  ← candle list format
+          - {"candles":[{"time","open","close",...}, ...]}  ← candle dict format
+          - [[ts, price, dir], ...]  (قائمة ticks مباشرة)
+        """
+        ticks_or_candles = None
+        if isinstance(payload, dict):
+            ticks_or_candles = (payload.get("history") or payload.get("candles")
+                                or payload.get("data") or payload.get("list")
+                                or payload.get("ticks"))
+            if ticks_or_candles is None and isinstance(payload.get("data"), dict):
+                ticks_or_candles = (payload["data"].get("candles")
+                                     or payload["data"].get("history") or [])
+        elif isinstance(payload, list):
+            ticks_or_candles = payload
+        if not ticks_or_candles or not isinstance(ticks_or_candles, list):
+            return None
+        if not ticks_or_candles:
+            return None
+        last = ticks_or_candles[-1]
+        # tick: [timestamp, price, direction]  → index 1 = price
+        # candle list: [time, open, close, high, low, vol]  → index 2 = close
+        if isinstance(last, (list, tuple)):
+            if len(last) >= 2:
+                try:
+                    return float(last[1])   # tick price
+                except (ValueError, TypeError):
+                    pass
+            if len(last) >= 3:
+                try:
+                    return float(last[2])   # candle close
+                except (ValueError, TypeError):
+                    pass
+        elif isinstance(last, dict):
+            for k in ("price", "close", "last", "value"):
+                if k in last:
+                    try:
+                        return float(last[k])
+                    except (ValueError, TypeError):
+                        continue
+        return None
 
     def _on_sentiment(self, *args) -> None:
         """يُستدعى عند وصول s_asset/sentiment. يطبع نسبة الدفع فوراً."""
-        if not self._enabled or not args:
+        if not self._enabled and not self.debug:
+            return
+        if not args:
             return
         payload = args[0]
+        if self.debug:
+            ts = datetime.now().strftime("%H:%M:%S")
+            preview = str(payload)[:200]
+            print(f"  {Colors.DIM}[{ts}] DEBUG s_asset/sentiment: {preview}{Colors.RESET}")
+        if not self._enabled:
+            return
         items = payload if isinstance(payload, list) else [payload]
         for item in items:
             if not isinstance(item, dict) or "asset" not in item:
@@ -3153,12 +3312,23 @@ class LivePriceStream:
             print(f"  {Colors.YELLOW}[{ts}] PAYOUT {Colors.RESET}"
                   f"{asset:<20} {payout_str}")
 
-    def _print_quote(self, asset: str, item: Dict[str, Any]) -> None:
-        """يطبع سطر سعر لحظي واحد."""
+    def _print_quote(self, asset: str, price_or_item: Any) -> None:
+        """يطبع سطر سعر لحظي واحد.
+
+        يقبل إما:
+          - قيمة سعر مباشرة (float/int)
+          - أو dict يحتوي على مفتاح سعر
+        """
         price = None
-        for k in ("price", "value", "rate", "last", "bid", "ask"):
-            if k in item:
-                price = item[k]; break
+        if isinstance(price_or_item, (int, float)):
+            price = float(price_or_item)
+        elif isinstance(price_or_item, dict):
+            for k in ("price", "value", "rate", "last", "bid", "ask", "close"):
+                if k in price_or_item:
+                    try:
+                        price = float(price_or_item[k]); break
+                    except (ValueError, TypeError):
+                        continue
         sent = self.api.assets_sentiment.get(asset, {}) if self.api else {}
         payout = sent.get("sentiment") if isinstance(sent, dict) else None
         ts = datetime.now().strftime("%H:%M:%S")
@@ -3454,6 +3624,7 @@ def print_help() -> None:
     print(f"  {Colors.CYAN}watch all{Colors.RESET}                       Stream all assets (default)")
     print(f"  {Colors.CYAN}pause{Colors.RESET}                           Pause live price stream")
     print(f"  {Colors.CYAN}resume{Colors.RESET}                          Resume live price stream")
+    print(f"  {Colors.CYAN}debug{Colors.RESET}                           Toggle debug mode (print raw WS events)")
     print(f"  {Colors.CYAN}snapshot{Colors.RESET}                         Save JSON snapshot of all assets+payout+price")
     print(f"  {Colors.CYAN}help{Colors.RESET}                            Show this help")
     print(f"  {Colors.CYAN}quit{Colors.RESET}                            Exit")
@@ -3520,6 +3691,15 @@ async def process_command(cmd_line: str, client: "Binolla",
     elif cmd == "resume":
         live_stream.resume()
         print(f"{Colors.GREEN}Live price stream resumed.{Colors.RESET}")
+    elif cmd == "debug":
+        if rest and rest[0].lower() in ("off", "0", "false", "no"):
+            live_stream.set_debug(False)
+            print(f"{Colors.YELLOW}Debug mode OFF.{Colors.RESET}")
+        else:
+            live_stream.set_debug(True)
+            print(f"{Colors.GREEN}Debug mode ON — will print raw s_quotes/list, "
+                  f"s_history/last, s_asset/sentiment events as they arrive.{Colors.RESET}")
+            print(f"{Colors.DIM}Type 'debug off' to disable.{Colors.RESET}")
     elif cmd == "snapshot":
         if client.api and (client.api.assets_sentiment or client.api.assets_quotes):
             snapshot = await fetch_all_assets_info(client, wait_seconds=0.5)
