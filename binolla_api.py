@@ -3071,6 +3071,20 @@ def parse_args() -> Dict[str, Any]:
 # ==============================================================================
 # SECTION 14.5: LIVE PRICE STREAM (event-driven, continuous)
 # ==============================================================================
+def _is_likely_timestamp(value: float) -> bool:
+    """يتحقق هل القيمة تبدو Unix timestamp (وليست سعراً).
+
+    أسعار الفوركس/الأسهم عادةً < 100000 (حتى BTC ~$100k).
+    Unix timestamps منذ 2001-09-09 = 1,000,000,000 (1e9).
+    منذ 2001 = 1e9، منذ 2020 = 1.5e9، منذ 2026 = 1.79e9.
+
+    أي قيمة >= 1e9 تُعتبر timestamp وليست سعراً.
+    """
+    if not isinstance(value, (int, float)):
+        return False
+    return abs(value) >= 1_000_000_000   # 1e9 = Sept 2001
+
+
 class LivePriceStream:
     """يبث الأسعار اللحظية بشكل مستمر — يُطبع كل تحديث سعر فور وصوله.
 
@@ -3210,30 +3224,43 @@ class LivePriceStream:
           - ("EURUSD_otc", 1.0823)  (tuple)
           - ["EURUSD_otc", 1.0823]  (list)
           - 1.0823  (قيمة بسيطة — يستخدم اسم الأصل الحالي)
+
+        مهم: يرفض القيم التي تبدو timestamps (Unix time) بدلاً من أسعار.
         """
         if isinstance(item, dict):
             asset = item.get("asset") or item.get("name") or item.get("symbol")
             price = None
-            for k in ("price", "value", "rate", "last", "bid", "ask", "close"):
+            for k in ("price", "bid", "ask", "close", "rate", "last", "value"):
                 if k in item:
                     try:
-                        price = float(item[k])
-                        break
+                        candidate = float(item[k])
+                        if not _is_likely_timestamp(candidate):
+                            price = candidate
+                            break
                     except (ValueError, TypeError):
                         continue
             return asset, price
         if isinstance(item, (list, tuple)) and len(item) >= 2:
             asset = item[0] if isinstance(item[0], str) else None
-            try:
-                price = float(item[1])
-            except (ValueError, TypeError):
-                price = None
+            # جرّب كل المواضع لإيجاد قيمة تبدو سعراً (وليست timestamp)
+            price = None
+            for idx in range(1, len(item)):
+                try:
+                    candidate = float(item[idx])
+                    if not _is_likely_timestamp(candidate):
+                        price = candidate
+                        break
+                except (ValueError, TypeError):
+                    continue
             return asset, price
         # قيمة بسيطة — استخدم الأصل الحالي
         if isinstance(item, (int, float)):
             asset = self.watch_asset or (self.api.current_asset if self.api else None)
             try:
-                return asset, float(item)
+                val = float(item)
+                if _is_likely_timestamp(val):
+                    return asset, None
+                return asset, val
             except (ValueError, TypeError):
                 return asset, None
         return None, None
@@ -3246,6 +3273,8 @@ class LivePriceStream:
           - {"candles":[[time, o, c, h, l, v], ...]}  ← candle list format
           - {"candles":[{"time","open","close",...}, ...]}  ← candle dict format
           - [[ts, price, dir], ...]  (قائمة ticks مباشرة)
+
+        مهم: يرفض القيم التي تبدو timestamps (Unix time).
         """
         ticks_or_candles = None
         if isinstance(payload, dict):
@@ -3261,25 +3290,37 @@ class LivePriceStream:
             return None
         if not ticks_or_candles:
             return None
-        last = ticks_or_candles[-1]
-        # tick: [timestamp, price, direction]  → index 1 = price
-        # candle list: [time, open, close, high, low, vol]  → index 2 = close
-        if isinstance(last, (list, tuple)):
-            if len(last) >= 2:
-                try:
-                    return float(last[1])   # tick price
-                except (ValueError, TypeError):
-                    pass
-            if len(last) >= 3:
-                try:
-                    return float(last[2])   # candle close
-                except (ValueError, TypeError):
-                    pass
-        elif isinstance(last, dict):
-            for k in ("price", "close", "last", "value"):
-                if k in last:
+        # ابحث في آخر tick/شمعة، وإن كان سعره يبدو timestamp، جرّب السابق
+        for idx in range(len(ticks_or_candles) - 1, -1, -1):
+            last = ticks_or_candles[idx]
+            price = self._extract_price_from_tick_or_candle(last)
+            if price is not None and not _is_likely_timestamp(price):
+                return price
+        return None
+
+    def _extract_price_from_tick_or_candle(self, item: Any) -> Optional[float]:
+        """يستخرج السعر من tick أو candle واحد.
+        - tick: [ts, price, dir]  → يجرّب index 1 ثم 2
+        - candle list: [time, o, c, h, l, v]  → يجرّب index 2 (close) ثم 1 (open)
+        - candle dict: {"price":...} أو {"close":...}
+        يرفض القيم التي تبدو timestamps.
+        """
+        if isinstance(item, (list, tuple)):
+            for idx in (1, 2, 3):
+                if idx < len(item):
                     try:
-                        return float(last[k])
+                        candidate = float(item[idx])
+                        if not _is_likely_timestamp(candidate):
+                            return candidate
+                    except (ValueError, TypeError):
+                        continue
+        elif isinstance(item, dict):
+            for k in ("price", "close", "bid", "ask", "rate", "last", "value"):
+                if k in item:
+                    try:
+                        candidate = float(item[k])
+                        if not _is_likely_timestamp(candidate):
+                            return candidate
                     except (ValueError, TypeError):
                         continue
         return None
@@ -3313,32 +3354,42 @@ class LivePriceStream:
                   f"{asset:<20} {payout_str}")
 
     def _print_quote(self, asset: str, price_or_item: Any) -> None:
-        """يطبع سطر سعر لحظي واحد.
+        """يطبع/يحدّث سطر السعر اللحظي على نفس السطر (inline update).
 
+        يستخدم carriage return (\\r) للكتابة فوق نفس السطر بدلاً من طباعة سطر جديد.
         يقبل إما:
           - قيمة سعر مباشرة (float/int)
           - أو dict يحتوي على مفتاح سعر
         """
         price = None
         if isinstance(price_or_item, (int, float)):
-            price = float(price_or_item)
+            candidate = float(price_or_item)
+            if not _is_likely_timestamp(candidate):
+                price = candidate
         elif isinstance(price_or_item, dict):
-            for k in ("price", "value", "rate", "last", "bid", "ask", "close"):
+            for k in ("price", "bid", "ask", "close", "rate", "last", "value"):
                 if k in price_or_item:
                     try:
-                        price = float(price_or_item[k]); break
+                        candidate = float(price_or_item[k])
+                        if not _is_likely_timestamp(candidate):
+                            price = candidate
+                            break
                     except (ValueError, TypeError):
                         continue
         sent = self.api.assets_sentiment.get(asset, {}) if self.api else {}
         payout = sent.get("sentiment") if isinstance(sent, dict) else None
         ts = datetime.now().strftime("%H:%M:%S")
         payout_str = f"{payout}%" if payout is not None else "—"
-        price_str = f"{price}" if price is not None else "—"
+        price_str = f"{price}" if price is not None else "waiting..."
         self._print_count += 1
-        print(f"  {Colors.DIM}[{ts}]#{self._print_count}{Colors.RESET} "
-              f"{Colors.GREEN}{asset:<20}{Colors.RESET} "
-              f"payout={payout_str:<6} "
-              f"price={Colors.CYAN}{price_str}{Colors.RESET}")
+        # استخدم \r للكتابة فوق نفس السطر (inline update)
+        # استخدم \033[K لمسح باقي السطر
+        line = (f"\r\033[K  {Colors.DIM}[{ts}]#{self._print_count}{Colors.RESET} "
+                f"{Colors.GREEN}{asset:<20}{Colors.RESET} "
+                f"payout={payout_str:<6} "
+                f"price={Colors.CYAN}{price_str}{Colors.RESET}")
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
 
 # ==============================================================================
@@ -3533,14 +3584,15 @@ async def cmd_watch(live_stream: LivePriceStream,
 
 async def cmd_prices_live(client: "Binolla", live_stream: LivePriceStream,
                             asset_arg: Optional[str] = None) -> None:
-    """يبدأ بث سعر لحظي مستمر لأصل محدد.
+    """يبدأ بث سعر لحظي مستمر لأصل محدد (بعد تأكيد 'ok' من المستخدم).
 
     الآلية:
-    1) يرسل asset/list/change للأصل المطلوب لتفعيل تدفق s_quotes/list الخاص به.
-    2) يشترك في sentiment (نسبة الدفع) للأصل.
-    3) يضبط LivePriceStream على متابعة هذا الأصل حصرياً.
-    4) يستأنف البث إن كان متوقفاً.
-    5) يطبع رسالة تأكيد + أول سعر محفوظ إن وُجد.
+    1) يعرض ملخصاً ويطلب تأكيد 'ok' قبل البدء.
+    2) يرسل asset/list/change للأصل المطلوب لتفعيل تدفق s_quotes/list الخاص به.
+    3) يشترك في sentiment (نسبة الدفع) للأصل.
+    4) يضبط LivePriceStream على متابعة هذا الأصل حصرياً.
+    5) يستأنف البث إن كان متوقفاً.
+    6) السعر يُحدّث على نفس السطر (inline update).
 
     لإيقاف البث: اكتب 'stop' أو 'watch all' أو 'pause'.
     """
@@ -3553,9 +3605,41 @@ async def cmd_prices_live(client: "Binolla", live_stream: LivePriceStream,
         print(f"{Colors.DIM}         prices live EURUSD_otc{Colors.RESET}")
         return
     asset = asset_arg.strip()
+
+    # اطبع معلومات الأصل من قائمة الأصول المحفوظة
+    records = _extract_asset_records(client.api.assets_list) if client.api.assets_list else []
+    asset_info = next((r for r in records if r.get("asset") == asset), None)
     print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
-    print(f"{Colors.BOLD}  Starting LIVE price stream for: {asset}{Colors.RESET}")
+    print(f"{Colors.BOLD}  Live price stream request{Colors.RESET}")
     print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
+    if asset_info:
+        print(f"  Asset:       {asset}")
+        print(f"  Name:        {asset_info.get('name', '—')}")
+        print(f"  Type:        {asset_info.get('type', '—')}")
+        payout_cached = asset_info.get("payout")
+        if payout_cached is not None:
+            print(f"  Payout:      {payout_cached}%")
+        bid = asset_info.get("bid")
+        ask = asset_info.get("ask")
+        if bid is not None:
+            print(f"  Last bid:    {bid}")
+        if ask is not None:
+            print(f"  Last ask:    {ask}")
+    else:
+        print(f"  Asset: {asset} (not found in assets list — will try anyway)")
+
+    # اطلب تأكيد 'ok'
+    print(f"\n{Colors.YELLOW}Type 'ok' to start live stream, or anything else to cancel.{Colors.RESET}")
+    try:
+        confirm = (await ainput(f"Confirm [ok]: ")).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        confirm = ""
+    if confirm != "ok":
+        print(f"{Colors.YELLOW}Cancelled.{Colors.RESET}")
+        return
+
+    print(f"\n{Colors.CYAN}Starting LIVE price stream for: {asset}{Colors.RESET}")
+    print(f"{Colors.DIM}Price updates on this line (inline). Type 'stop' to end.{Colors.RESET}")
 
     # 1) فعّل تدفق quotes للأصل عبر asset/list/change
     try:
@@ -3580,33 +3664,9 @@ async def cmd_prices_live(client: "Binolla", live_stream: LivePriceStream,
     # 4) اضبط البث على هذا الأصل حصرياً + استأنف
     live_stream.set_watch(asset)
     live_stream.resume()
-
-    # 5) اطبع أول سعر محفوظ إن وُجد
-    existing_quote = client.api.assets_quotes.get(asset)
-    if existing_quote:
-        price = None
-        if isinstance(existing_quote, dict):
-            for k in ("price", "value", "rate", "last", "bid", "ask"):
-                if k in existing_quote:
-                    price = existing_quote[k]; break
-        elif isinstance(existing_quote, (int, float)):
-            price = float(existing_quote)
-        if price is not None:
-            print(f"{Colors.GREEN}Current cached price: {price}{Colors.RESET}")
-        else:
-            print(f"{Colors.DIM}Waiting for first live quote...{Colors.RESET}")
-    else:
-        print(f"{Colors.DIM}Waiting for first live quote (should arrive within 1-3s)...{Colors.RESET}")
-
-    # اطبع نسبة الدفع المحفوظة إن وُجدت
-    existing_sent = client.api.assets_sentiment.get(asset, {})
-    if isinstance(existing_sent, dict):
-        payout = existing_sent.get("sentiment")
-        if payout is not None:
-            print(f"{Colors.YELLOW}Current payout: {payout}%{Colors.RESET}")
-
-    print(f"\n{Colors.DIM}Live prices will stream below. Type 'stop' to return to normal.{Colors.RESET}")
-    print(f"{Colors.DIM}Or type any other command — stream continues in background.{Colors.RESET}\n")
+    # اطبع سطر فارغ ليكون هو السطر الذي يُحدّث
+    sys.stdout.write("\r\033[K  Waiting for first live quote...\r")
+    sys.stdout.flush()
 
 
 def print_help() -> None:
