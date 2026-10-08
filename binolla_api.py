@@ -2292,10 +2292,9 @@ async def keepalive_loop(client: "Binolla", stop_event: asyncio.Event) -> None:
     - نراقب `last_message_at` — إن لم تصل أي رسالة لأكثر من 60 ثانية، نُسجّل
       تحذيراً (الاتصال قد يكون معلّقاً).
     """
-    quotes_interval = 3.0   # ثانية بين كل طلب quotes/list (بث أكثر استجابة)
+    quotes_interval = 3.0   # ثانية بين كل طلب quotes/list
     assets_interval = 30.0  # ثانية بين كل طلب assets/list
     ws_ping_interval = 20.0    # Engine.IO PING كل 20 ثانية
-    stale_warning_threshold = 30.0   # 30 ثانية بدون رسائل = تحذير مبكر
     last_quotes_at = 0.0
     last_assets_at = 0.0
     last_ws_ping_at = 0.0
@@ -2344,11 +2343,12 @@ async def keepalive_loop(client: "Binolla", stop_event: asyncio.Event) -> None:
             except Exception as e:
                 logger.debug("keepalive assets/list err: %s", e)
 
-        # 5) فحص صحي مبكر — إن لم تصل رسائل منذ 30 ثانية، اضغط على الـ watchdog
+        # 5) فحص صحي — تحذير فقط، لا نُجبر إعادة الاتصال
+        #    الـ watchdog يعتمد على حالة الـ WebSocket الفعلية (on_close/on_error)
         idle = now - client.api.last_message_at
-        if idle > stale_warning_threshold:
-            logger.warning("No WebSocket messages in %.0fs — forcing watchdog reconnect.", idle)
-            client.api.state.check_accepted_connection = False
+        if idle > 90.0:
+            logger.warning("No WebSocket messages in %.0fs (idle). "
+                          "Connection may be stale but not forcing reconnect.", idle)
 
 
 async def connect_binolla(token: str, is_demo: bool = True,
@@ -2466,8 +2466,8 @@ async def watchdog_reconnect_loop(client: "Binolla", args: Dict[str, Any],
     - لا يطلب أي إدخال من المستخدم.
     - يحاول إعادة الاتصال حتى 5 مرات بفواصل متزايدة (1s, 2s, 4s, 8s, 16s).
     """
-    check_interval = 5.0      # فحص كل 5 ثوانٍ (أسرع من 10)
-    stale_threshold = 30.0    # 30 ثانية بدون رسائل = اتصال ميت (أسرع من 90)
+    check_interval = 10.0     # فحص كل 10 ثوانٍ
+    stale_threshold = 180.0   # 3 دقائق بدون رسائل = اتصال ميت فعلاً
     max_reconnect_attempts = 5
 
     while not stop_event.is_set():
@@ -2481,16 +2481,21 @@ async def watchdog_reconnect_loop(client: "Binolla", args: Dict[str, Any],
             continue
 
         # تحقق من حالة الاتصال
+        # مهم: لا نُعيد الاتصال إلا إذا كان check_accepted_connection = False
+        # (سُقط من on_close/on_error فعلياً). هذا يمنع إعادة الاتصال
+        # غير الضروري عندما يكون السيرفر بطيئاً مؤقتاً.
         connected = client.api.state.check_accepted_connection
-        idle = time.time() - client.api.last_message_at
         ws_status = client.api.state.status
 
-        if connected and idle < stale_threshold:
-            # كل شيء بخير
+        if connected:
+            # الاتصال سليم — لا نُعيد الاتصال أبداً
             continue
         if ws_status == WebsocketStatus.CONNECTING:
             # ما زال يحاول الاتصال — انتظر
             continue
+        # check_accepted_connection = False → انقطع فعلاً (on_close/on_error)
+        # نُعيد الاتصال فوراً
+        idle = time.time() - client.api.last_message_at
 
         # الاتصال ميت أو معلّق — أعد الاتصال
         logmsg(f"{Colors.YELLOW}Watchdog: connection dead (connected={connected}, "
